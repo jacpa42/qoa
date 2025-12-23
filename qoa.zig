@@ -35,20 +35,20 @@ pub const QOA = struct {
 /// Wraps a standard Io.Reader for a qoa file and decodes and returns the sample slices of size 20
 pub const QOASliceIter = struct {
     reader: *std.Io.Reader,
+    decoded_sample_buffer: [num_samples_in_slice]i16,
     lms_states: [max_decode_channels]LMSState,
     slice_no: u8,
-    channel_no: u3,
-    bytes_remaining_in_frame: i32,
+    channel_no: u8,
+    samples_remaining_in_frame: i32,
 
     // some useful data for reencoding or using the data in some way
     sample_count: u32,
     sample_rate: u32,
-    channels: u32,
+    channel_count: u32,
 
-    /// Returns the total samples the iterator will produce.
-    /// NOTE: `QOAFrameIter.sample_count * QOAFrameIter.channels`.
+    /// Returns the total 16bit samples the iterator will produce.
     pub inline fn totalSamples(self: *const QOASliceIter) usize {
-        return @as(usize, self.sample_count) * @as(usize, self.channels);
+        return @as(usize, self.sample_count) * @as(usize, self.channel_count);
     }
 
     /// Returns some data about the file which can be stored by the caller ensure correctness for decoding and encoding.
@@ -61,7 +61,7 @@ pub const QOASliceIter = struct {
         // Take one frame header (any valid qoa file must have at least one frame)
         const frame_header = try FrameHeader.peek(reader);
 
-        if (frame_header.num_channels == 0 or
+        if (frame_header.channel_count == 0 or
             frame_header.sample_rate == 0 or
             file_header.samples == 0)
         {
@@ -70,30 +70,30 @@ pub const QOASliceIter = struct {
 
         return QOASliceIter{
             .reader = reader,
+            .decoded_sample_buffer = undefined,
             .lms_states = undefined,
             .slice_no = 0,
             .channel_no = 0,
-            .bytes_remaining_in_frame = 0,
+            .samples_remaining_in_frame = 0,
 
             .sample_count = file_header.samples,
             .sample_rate = frame_header.sample_rate,
-            .channels = frame_header.num_channels,
+            .channel_count = frame_header.channel_count,
         };
     }
 
-    /// Grabs the next slice and decodes them.
+    /// Grabs the next slice and decodes it.
     ///
-    /// This just reads the next slice
+    /// NOTE: For the last slice in the file, it might contain some zeroed out samples.
     pub fn next(
         self: *QOASliceIter,
-    ) DecodeError!?[num_samples_in_slice]i16 {
-        var samples: [num_samples_in_slice]i16 = undefined;
+    ) DecodeError!?[]i16 {
         const slice = (try self.nextSlice()) orelse return null;
 
-        std.debug.print(
-            "{:3} {:3}: {x}\n",
-            .{ self.slice_no, self.channel_no, @as(u64, @bitCast(slice)) },
-        );
+        // std.debug.print(
+        //     "{:3} {:3}: {x}\n",
+        //     .{ self.slice_no, self.channel_no, @as(u64, @bitCast(slice)) },
+        // );
 
         const sf: f32 = dequant(@floatFromInt(slice.scale_factor));
         inline for (0.., @typeInfo(Slice.Residuals).@"struct".fields) |i, field| {
@@ -101,30 +101,33 @@ pub const QOASliceIter = struct {
             const r = @as(i16, @intFromFloat(@round(sf * dequant_tab[qr])));
             const s = r +| self.lms_states[self.channel_no].predict();
 
-            samples[i] = s;
+            self.decoded_sample_buffer[i] = s;
 
             self.lms_states[self.channel_no].update(r, s);
         }
 
-        return samples;
+        if (self.samples_remaining_in_frame < 0) {
+            const valid_sample_len = self.samples_remaining_in_frame + num_samples_in_slice;
+
+            std.debug.assert(0 < valid_sample_len);
+            std.debug.assert(valid_sample_len < self.decoded_sample_buffer.len);
+
+            return self.decoded_sample_buffer[0..@as(usize, @intCast(valid_sample_len))];
+        } else {
+            return self.decoded_sample_buffer[0..];
+        }
     }
 
     fn nextSlice(
         self: *QOASliceIter,
     ) DecodeError!?Slice {
-        if (self.bytes_remaining_in_frame <= 0) {
-            // NOTE: This might not be 0 if the file was encoded incorrectly and the bytes in
-            // the frame is not divisible by 8 (after parsing the header that is).
-            std.debug.assert(self.bytes_remaining_in_frame == 0);
-            self.nextFrame() catch |err| {
-                // we must be at the end of the file.
-                if (err == error.EndOfStream) return null;
-                return err;
-            };
+        if (self.samples_remaining_in_frame < 0) {
+            return null;
+        } else if (self.samples_remaining_in_frame == 0) {
+            const byte_stream_finished = try self.nextFrame();
+            if (byte_stream_finished) return null;
         } else {
-            // Assert that u3 actually overflow as expected
-
-            if (self.channel_no == self.channels - 1) {
+            if (self.channel_no == self.channel_count - 1) {
                 self.channel_no = 0;
                 self.slice_no +%= 1;
             } else {
@@ -133,37 +136,47 @@ pub const QOASliceIter = struct {
         }
 
         const slice = try Slice.take(self.reader);
-        self.bytes_remaining_in_frame -= @sizeOf(@TypeOf(slice));
+        self.samples_remaining_in_frame -= num_samples_in_slice;
 
         return slice;
     }
 
-    fn nextFrame(self: *QOASliceIter) DecodeError!void {
-        const header = try FrameHeader.take(self.reader);
+    const StreamFinished = bool;
 
-        if (header.num_channels != self.channels or
+    fn nextFrame(
+        self: *QOASliceIter,
+    ) error{
+        ReadFailed,
+        EndOfStream,
+        InvalidFileFormat,
+    }!StreamFinished {
+        const header = FrameHeader.take(self.reader) catch |err| {
+            if (err == error.EndOfStream) return true else return err;
+        };
+
+        if (header.channel_count != self.channel_count or
             header.sample_rate != self.sample_rate)
         {
             std.log.err(
-                "Found invalid frame header:\n{any}\nExpected num_channels=={} and sample_rate=={}",
+                \\Found invalid frame header: {any}
+                \\Expected num_channels=={} and sample_rate=={}
+            ,
                 .{ header, self.channel_no, self.sample_rate },
             );
             return error.InvalidFileFormat;
         }
 
-        self.slice_no = 0;
-        self.channel_no = 0;
-
-        // Parse all the lms states from the file
-        var lms_states: [max_decode_channels]LMSState = undefined;
-        for (lms_states[0..header.num_channels]) |*lms_state| {
-            lms_state.* = try .take(self.reader);
+        for (0..self.channel_count) |i| {
+            self.lms_states[i] = try .take(self.reader);
         }
 
-        self.bytes_remaining_in_frame =
-            @as(i32, header.size) -
-            @sizeOf(FrameHeader) -
-            @as(i32, header.num_channels) * @sizeOf(LMSState);
+        self.slice_no = 0;
+        self.channel_no = 0;
+        self.samples_remaining_in_frame =
+            @as(i32, header.samples_per_channel) *
+            @as(i32, header.channel_count);
+
+        return false;
     }
 };
 
@@ -174,7 +187,7 @@ pub const Header = extern struct {
 
 /// This header is before each frame. All values expect `size` need to match frame to frame.
 pub const FrameHeader = packed struct(u64) {
-    num_channels: u8,
+    channel_count: u8,
     /// In hertz
     sample_rate: u24,
     /// Samples per channel in this frame
@@ -186,14 +199,13 @@ pub const FrameHeader = packed struct(u64) {
         reader: *std.Io.Reader,
     ) error{ ReadFailed, EndOfStream }!FrameHeader {
         return FrameHeader{
-            .num_channels = try reader.takeByte(),
+            .channel_count = try reader.takeByte(),
             .sample_rate = try reader.takeInt(u24, endianess),
             .samples_per_channel = try reader.takeInt(u16, endianess),
             .size = try reader.takeInt(u16, endianess),
         };
     }
 
-    /// Does not modify the reader
     inline fn peek(
         reader: *std.Io.Reader,
     ) error{ ReadFailed, EndOfStream }!FrameHeader {
@@ -205,7 +217,7 @@ pub const FrameHeader = packed struct(u64) {
         const btn = std.mem.bigToNative;
 
         return FrameHeader{
-            .num_channels = next_header_slice[0],
+            .channel_count = next_header_slice[0],
             .sample_rate = btn(u24, @bitCast(next_header_slice[1..4].*)),
             .samples_per_channel = btn(u16, @bitCast(next_header_slice[4..6].*)),
             .size = btn(u16, @bitCast(next_header_slice[6..8].*)),
@@ -214,6 +226,8 @@ pub const FrameHeader = packed struct(u64) {
 };
 
 /// Parses bytes from reader into `QOA`.
+///
+/// Contains at most 19 invalid samples (which are zeroed out according to the spec);
 pub fn fromReader(
     alloc: std.mem.Allocator,
     reader: *std.Io.Reader,
@@ -225,12 +239,18 @@ pub fn fromReader(
     var samples = std.ArrayList(i16).initBuffer(sample_buf);
 
     while (try iter.next()) |new_samples| {
-        try samples.appendSliceBounded(&new_samples);
+        try samples.appendSliceBounded(new_samples);
+    }
+
+    std.debug.assert(samples.capacity == samples.items.len);
+
+    while (try iter.next()) |another_slice| {
+        std.debug.print("what the hell?? {any}\n", .{another_slice});
     }
 
     return QOA{
         .sample_rate = iter.sample_rate,
-        .channels = iter.channels,
+        .channels = iter.channel_count,
         .samples = sample_buf,
     };
 }
