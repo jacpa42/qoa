@@ -7,8 +7,9 @@ pub fn build(b: *std.Build) void {
     const libqoa = b.addLibrary(.{
         .name = "qoa",
         .linkage = .static,
+        .use_llvm = optimize == .Debug,
         .root_module = b.addModule("qoa", .{
-            .root_source_file = b.path("QOA.zig"),
+            .root_source_file = b.path("qoa.zig"),
             .target = target,
             .optimize = optimize,
         }),
