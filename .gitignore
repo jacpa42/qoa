@@ -1,0 +1,9 @@
+.zig-cache/
+zig-out/
+images/
+**.pdf
+**/.DS_Store
+**.wav
+**.qoa
+**qoaconv
+samples/
