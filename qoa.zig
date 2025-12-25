@@ -9,12 +9,28 @@ pub const DecodeError = error{
 
 const magic = "qoaf";
 const endianess = std.builtin.Endian.big;
-const dequant_tab = [_]f32{ 0.75, -0.75, 2.5, -2.5, 4.5, -4.5, 7, -7 };
 const max_decode_channels = 8;
 const num_samples_in_slice = 20;
+const max_samples_in_frame = 256 * num_samples_in_slice * max_decode_channels;
+const dequant_tab: [16][8]i16 = blk: {
+    const dt = [_]comptime_float{ 0.75, -0.75, 2.5, -2.5, 4.5, -4.5, 7, -7 };
+    var array: [16][8]i16 = @splat(@splat(0));
+    var sf = 0;
+    while (sf < 16) : (sf += 1) {
+        @setEvalBranchQuota(2000);
+        const scale_factor = @round(std.math.pow(f32, @as(f32, sf + 1), 2.75));
+        var qr = 0;
+        while (qr < 8) : (qr += 1) {
+            array[sf][qr] = @round(scale_factor * dt[qr]);
+        }
+    }
 
-inline fn dequant(scale_factor_quant: f32) f32 {
-    return @round(std.math.pow(f32, scale_factor_quant + 1, 2.75));
+    break :blk array;
+};
+
+inline fn dequant(scale_factor_quant: u4) f32 {
+    const scale_factor: f32 = @floatFromInt(@as(u8, scale_factor_quant) + 1);
+    return @round(std.math.pow(f32, scale_factor, 2.75));
 }
 
 /// A decoded qoa file
@@ -33,7 +49,7 @@ pub const QOA = struct {
 };
 
 /// Wraps a standard Io.Reader for a qoa file and decodes and returns the sample slices of size 20
-pub const QOASliceIter = struct {
+pub const Iter = struct {
     reader: *std.Io.Reader,
     decoded_sample_buffer: [num_samples_in_slice]i16,
     lms_states: [max_decode_channels]LMSState,
@@ -41,20 +57,21 @@ pub const QOASliceIter = struct {
     channel_no: u8,
     samples_remaining_in_frame: i32,
 
-    // some useful data for reencoding or using the data in some way
+    // Some useful data for reencoding or using the data in some way
     sample_count: u32,
-    sample_rate: u32,
-    channel_count: u32,
+    sample_rate: u24,
+    channel_count: u8,
 
     /// Returns the total 16bit samples the iterator will produce.
-    pub inline fn totalSamples(self: *const QOASliceIter) usize {
+    pub inline fn totalSamples(self: *const Iter) usize {
         return @as(usize, self.sample_count) * @as(usize, self.channel_count);
     }
 
     /// Returns some data about the file which can be stored by the caller ensure correctness for decoding and encoding.
+    /// Retains a pointer to the reader.
     pub fn init(
         reader: *std.Io.Reader,
-    ) error{ ReadFailed, EndOfStream, InvalidFileFormat }!QOASliceIter {
+    ) error{ ReadFailed, EndOfStream, InvalidFileFormat }!Iter {
         const file_header = try reader.takeStruct(Header, endianess);
         if (!std.mem.eql(u8, magic, &file_header.magic)) return error.InvalidFileFormat;
 
@@ -68,10 +85,15 @@ pub const QOASliceIter = struct {
             return error.InvalidFileFormat;
         }
 
-        return QOASliceIter{
+        std.log.info("QOA iter size   {}b align={}", .{ @sizeOf(Iter), @alignOf(Iter) });
+        std.log.info("QOA samples     {}", .{file_header.samples});
+        std.log.info("QOA sample rate {}", .{frame_header.sample_rate});
+        std.log.info("QOA channels    {}", .{frame_header.channel_count});
+
+        return Iter{
             .reader = reader,
-            .decoded_sample_buffer = undefined,
-            .lms_states = undefined,
+            .decoded_sample_buffer = @splat(0),
+            .lms_states = @splat(.{}),
             .slice_no = 0,
             .channel_no = 0,
             .samples_remaining_in_frame = 0,
@@ -86,41 +108,42 @@ pub const QOASliceIter = struct {
     ///
     /// NOTE: For the last slice in the file, it might contain some zeroed out samples.
     pub fn next(
-        self: *QOASliceIter,
+        self: *Iter,
     ) DecodeError!?[]i16 {
-        const slice = (try self.nextSlice()) orelse return null;
+        var slice = (try self.nextSlice()) orelse return null;
+        const lms = &self.lms_states[self.channel_no];
 
-        // std.debug.print(
-        //     "{:3} {:3}: {x}\n",
-        //     .{ self.slice_no, self.channel_no, @as(u64, @bitCast(slice)) },
-        // );
+        const sf: u4 = @truncate(slice >> 60);
+        slice <<= @bitSizeOf(@TypeOf(sf));
 
-        const sf: f32 = dequant(@floatFromInt(slice.scale_factor));
-        inline for (0.., @typeInfo(Slice.Residuals).@"struct".fields) |i, field| {
-            const qr: u3 = @field(slice.residuals, field.name);
-            const r = @as(i16, @intFromFloat(@round(sf * dequant_tab[qr])));
-            const s = r +| self.lms_states[self.channel_no].predict();
+        for (&self.decoded_sample_buffer) |*sample| {
+            const qr: u3 = @truncate(slice >> 61);
 
-            self.decoded_sample_buffer[i] = s;
+            const dequantized = @as(i32, dequant_tab[sf][qr]);
+            const predicted = lms.predict();
+            const reconstructed = std.math.lossyCast(i16, predicted + dequantized);
 
-            self.lms_states[self.channel_no].update(r, s);
+            sample.* = reconstructed;
+            slice <<= @bitSizeOf(@TypeOf(qr));
+            lms.update(dequantized, reconstructed);
         }
 
-        if (self.samples_remaining_in_frame < 0) {
+        if (self.samples_remaining_in_frame >= 0) {
+            @branchHint(.likely);
+            return &self.decoded_sample_buffer;
+        } else {
             const valid_sample_len = self.samples_remaining_in_frame + num_samples_in_slice;
 
             std.debug.assert(0 < valid_sample_len);
             std.debug.assert(valid_sample_len < self.decoded_sample_buffer.len);
 
             return self.decoded_sample_buffer[0..@as(usize, @intCast(valid_sample_len))];
-        } else {
-            return self.decoded_sample_buffer[0..];
         }
     }
 
     fn nextSlice(
-        self: *QOASliceIter,
-    ) DecodeError!?Slice {
+        self: *Iter,
+    ) DecodeError!?u64 {
         if (self.samples_remaining_in_frame < 0) {
             return null;
         } else if (self.samples_remaining_in_frame == 0) {
@@ -135,7 +158,7 @@ pub const QOASliceIter = struct {
             }
         }
 
-        const slice = try Slice.take(self.reader);
+        const slice = try self.reader.takeInt(u64, endianess);
         self.samples_remaining_in_frame -= num_samples_in_slice;
 
         return slice;
@@ -144,7 +167,7 @@ pub const QOASliceIter = struct {
     const StreamFinished = bool;
 
     fn nextFrame(
-        self: *QOASliceIter,
+        self: *Iter,
     ) error{
         ReadFailed,
         EndOfStream,
@@ -170,11 +193,20 @@ pub const QOASliceIter = struct {
             self.lms_states[i] = try .take(self.reader);
         }
 
+        const SampleType = @TypeOf(self.samples_remaining_in_frame);
+        if (max_samples_in_frame > std.math.maxInt(SampleType) or
+            max_samples_in_frame < std.math.minInt(SampleType))
+        {
+            @compileError("");
+        }
+        const total_samples = std.math.mulWide(u16, header.samples_per_channel, header.channel_count);
+        if (total_samples > max_samples_in_frame) {
+            std.debug.panic("sample per channel is too wide: {}", .{total_samples});
+        }
+
+        self.samples_remaining_in_frame = @as(i32, header.samples_per_channel) * header.channel_count;
         self.slice_no = 0;
         self.channel_no = 0;
-        self.samples_remaining_in_frame =
-            @as(i32, header.samples_per_channel) *
-            @as(i32, header.channel_count);
 
         return false;
     }
@@ -195,32 +227,31 @@ pub const FrameHeader = packed struct(u64) {
     /// Frame size (including this header)
     size: u16,
 
+    const backing_size = @sizeOf(@typeInfo(FrameHeader).@"struct".backing_integer.?);
+
     inline fn take(
         reader: *std.Io.Reader,
     ) error{ ReadFailed, EndOfStream }!FrameHeader {
-        return FrameHeader{
-            .channel_count = try reader.takeByte(),
-            .sample_rate = try reader.takeInt(u24, endianess),
-            .samples_per_channel = try reader.takeInt(u16, endianess),
-            .size = try reader.takeInt(u16, endianess),
-        };
+        const next_header_slice: [8]u8 = (try reader.takeArray(backing_size)).*;
+        return .fromBytes(next_header_slice);
     }
 
     inline fn peek(
         reader: *std.Io.Reader,
     ) error{ ReadFailed, EndOfStream }!FrameHeader {
-        const next_header_slice: *[8]u8 = try reader.peekArray(
-            comptime @sizeOf(@typeInfo(FrameHeader).@"struct".backing_integer.?),
-        );
+        const next_header_slice: [8]u8 = (try reader.peekArray(backing_size)).*;
+        return .fromBytes(next_header_slice);
+    }
 
+    inline fn fromBytes(bytes: [8]u8) FrameHeader {
         if (endianess != .big) @compileError("bruh");
         const btn = std.mem.bigToNative;
 
         return FrameHeader{
-            .channel_count = next_header_slice[0],
-            .sample_rate = btn(u24, @bitCast(next_header_slice[1..4].*)),
-            .samples_per_channel = btn(u16, @bitCast(next_header_slice[4..6].*)),
-            .size = btn(u16, @bitCast(next_header_slice[6..8].*)),
+            .channel_count = bytes[0],
+            .sample_rate = btn(u24, @bitCast(bytes[1..4].*)),
+            .samples_per_channel = btn(u16, @bitCast(bytes[4..6].*)),
+            .size = btn(u16, @bitCast(bytes[6..8].*)),
         };
     }
 };
@@ -232,9 +263,14 @@ pub fn fromReader(
     alloc: std.mem.Allocator,
     reader: *std.Io.Reader,
 ) DecodeError!QOA {
-    var iter = try QOASliceIter.init(reader);
+    var iter = try Iter.init(reader);
     const sample_buf = try alloc.alloc(i16, iter.totalSamples());
     errdefer alloc.free(sample_buf);
+
+    std.log.err(
+        "sizeof iterator size={}b align={}",
+        .{ @sizeOf(Iter), @alignOf(Iter) },
+    );
 
     var samples = std.ArrayList(i16).initBuffer(sample_buf);
 
@@ -255,76 +291,63 @@ pub fn fromReader(
     };
 }
 
-const Slice = packed struct(u64) {
-    scale_factor: u4,
-    residuals: Residuals,
+const LMSState = struct {
+    history: @Vector(4, i32) = zero,
+    weights: @Vector(4, i32) = zero,
 
-    const Residuals = packed struct(u60) {
-        // zig fmt: off
-            qr01: u3, qr02: u3, qr03: u3, qr04: u3,
-            qr05: u3, qr06: u3, qr07: u3, qr08: u3,
-            qr09: u3, qr10: u3, qr11: u3, qr12: u3,
-            qr13: u3, qr14: u3, qr15: u3, qr16: u3,
-            qr17: u3, qr18: u3, qr19: u3, qr20: u3,
-            // zig fmt: on
-    };
-
-    inline fn take(
-        reader: *std.Io.Reader,
-    ) error{ ReadFailed, EndOfStream }!Slice {
-        return @bitCast(try reader.takeInt(u64, endianess));
-    }
-};
-
-const LMSState = extern struct {
-    history: vec(i16),
-    weights: vec(i16),
+    const zero: @Vector(4, i32) = @splat(0);
 
     inline fn take(
         reader: *std.Io.Reader,
     ) error{ ReadFailed, EndOfStream }!LMSState {
-        return reader.takeStruct(LMSState, endianess);
+        const LMSStateEncoded = extern struct {
+            history: [4]i16,
+            weights: [4]i16,
+        };
+
+        const lms = try reader.takeStruct(LMSStateEncoded, endianess);
+
+        return .{
+            .history = @as(@Vector(4, i32), lms.history),
+            .weights = @as(@Vector(4, i32), lms.weights),
+        };
     }
 
-    fn vec(comptime T: type) type {
-        return @Vector(4, T);
+    inline fn predict(self: LMSState) i32 {
+        return @reduce(.Add, self.history *% self.weights) >> 13;
     }
 
-    inline fn predict(self: LMSState) i16 {
-        const prod = @as(vec(i32), self.history) * @as(vec(i32), self.weights);
-        return @intCast(@reduce(.Add, prod) >> 13);
-    }
-
-    inline fn update(
+    fn update(
         self: *LMSState,
-        dequant_scaled_residual: i16,
-        output_sample: i16,
+        dequantized: i32,
+        reconstructed: i16,
     ) void {
-        self.updateWeights(dequant_scaled_residual);
-        self.updateHistory(output_sample);
+        self.updateWeights(dequantized);
+        self.updateHistory(reconstructed);
     }
 
     inline fn updateWeights(
         self: *LMSState,
-        dequant_scaled_residual: i16,
+        dequantized: i32,
     ) void {
-        const delta = dequant_scaled_residual >> 4;
+        const dlt: @Vector(4, i32) = @splat(dequantized >> 4);
+
         self.weights = @select(
-            i16,
-            self.history < @as(vec(i16), @splat(0)),
-            @as(vec(i16), @splat(-delta)),
-            @as(vec(i16), @splat(delta)),
+            i32,
+            self.history < zero,
+            self.weights -% dlt,
+            self.weights +% dlt,
         );
     }
 
-    fn updateHistory(
+    inline fn updateHistory(
         self: *LMSState,
         output_sample: i16,
     ) void {
         self.history = @shuffle(
-            i16,
+            i32,
             self.history,
-            @Vector(1, i16){output_sample},
+            @Vector(1, i32){output_sample},
             @Vector(4, i32){ 1, 2, 3, -1 },
         );
     }

@@ -1,76 +1,49 @@
 const std = @import("std");
-const rl = @import("raylib");
 const qoa = @import("qoa.zig");
 
 pub fn main() !void {
-    var debug_alloc = std.heap.DebugAllocator(.{}).init;
-    defer _ = debug_alloc.deinit();
-    const alloc = debug_alloc.allocator();
-
-    var path_opt: ?[:0]const u8 = null;
-
-    {
-        var args = std.process.args();
-        _ = args.next();
-        while (args.next()) |arg| {
-            path_opt = arg;
-        }
-    }
-
-    const path = path_opt orelse return error.ExpectedQoaFilePath;
+    var args = std.process.args();
+    _ = args.next();
+    const path = args.next() orelse @panic("Expected input qoa file.");
 
     const file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
 
-    var buf: [1024]u8 = undefined;
-    var file_reader = file.reader(&buf);
+    var reader_buf: [1024]u8 = undefined;
+    var file_reader = file.reader(&reader_buf);
+    var iter = try qoa.Iter.init(&file_reader.interface);
 
-    var decoded_qoa_file = try qoa.fromReader(alloc, &file_reader.interface);
-    defer decoded_qoa_file.deinit(alloc);
+    var write_buf: [128]u8 = undefined;
+    const stdout = std.fs.File.stdout();
 
-    if (decoded_qoa_file.samples.len == 0) return;
+    var writer = stdout.writer(&write_buf);
 
-    rl.initAudioDevice();
-    defer rl.closeAudioDevice();
+    try writeWav(&writer.interface, &iter);
+}
 
-    const stream = try rl.loadAudioStream(
-        decoded_qoa_file.sample_rate,
-        16,
-        decoded_qoa_file.channels,
-    );
-    defer rl.unloadAudioStream(stream);
+// Lifted from https://www.jonolick.com/code.html - public domain
+// Made endian agnostic using qoaconv_fwrite()
+fn writeWav(
+    writer: *std.Io.Writer,
+    iter: *qoa.Iter,
+) !void {
+    const data_size: u32 = iter.sample_count * iter.channel_count * @sizeOf(i16);
 
-    rl.playAudioStream(stream);
-    rl.setAudioStreamPan(stream, 0.5);
-    rl.setAudioStreamPitch(stream, 1);
-    rl.setAudioStreamVolume(stream, 1);
+    try writer.writeAll("RIFF");
+    try writer.writeInt(u32, data_size + 44 - 8, .little);
+    try writer.writeAll("WAVEfmt \x10\x00\x00\x00\x01\x00");
+    try writer.writeInt(i16, iter.channel_count, .little);
+    try writer.writeInt(u32, iter.sample_rate, .little);
+    try writer.writeInt(u32, iter.channel_count * iter.sample_rate * @bitSizeOf(i16) / 8, .little);
+    try writer.writeInt(i16, iter.channel_count * @bitSizeOf(i16) / 8, .little);
+    try writer.writeInt(i16, @bitSizeOf(i16), .little);
+    try writer.writeAll("data");
+    try writer.writeInt(u32, data_size, .little);
 
-    var samples_read: usize = 0;
-    const buf_size = 256;
-    rl.setAudioStreamBufferSizeDefault(buf_size);
-
-    while (true) {
-        if (rl.isAudioStreamProcessed(stream)) {
-            if (samples_read + buf_size > decoded_qoa_file.samples.len) {
-                rl.updateAudioStream(
-                    stream,
-                    @ptrCast(&decoded_qoa_file.samples.ptr[samples_read]),
-                    @intCast(decoded_qoa_file.samples.len - samples_read),
-                );
-                rl.updateAudioStream(
-                    stream,
-                    @ptrCast(decoded_qoa_file.samples.ptr),
-                    @intCast(buf_size - (decoded_qoa_file.samples.len - samples_read)),
-                );
-            } else {
-                rl.updateAudioStream(
-                    stream,
-                    @ptrCast(&decoded_qoa_file.samples[samples_read]),
-                    buf_size,
-                );
-            }
-            samples_read = (samples_read + buf_size) % decoded_qoa_file.samples.len;
-        }
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+    while (try iter.next()) |sample_buf| {
+        const raw_samples: []const u8 = std.mem.sliceAsBytes(sample_buf);
+        try writer.writeAll(raw_samples);
     }
+
+    try writer.flush();
 }

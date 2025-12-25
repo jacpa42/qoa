@@ -30,11 +30,6 @@ pub fn build(b: *std.Build) void {
             .target = target,
         }),
     });
-    const dep_raylib = b.dependency("raylib_zig", .{
-        .optimize = optimize,
-        .target = target,
-    });
-    tool_exe.root_module.addImport("raylib", dep_raylib.module("raylib"));
     const run_tool = b.addRunArtifact(tool_exe);
     for (b.args orelse &.{}) |arg| run_tool.addArg(arg);
     const tool_step = b.step("tool", "Run tool which decodes and file and then encodes it to stdout.");
