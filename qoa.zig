@@ -13,11 +13,12 @@ const max_decode_channels = 8;
 const num_samples_in_slice = 20;
 const max_samples_in_frame = 256 * num_samples_in_slice * max_decode_channels;
 const dequant_tab: [16][8]i16 = blk: {
+    // PERF: Precompute the dequant tab for epic speedups :)
     const dt = [_]comptime_float{ 0.75, -0.75, 2.5, -2.5, 4.5, -4.5, 7, -7 };
     var array: [16][8]i16 = @splat(@splat(0));
     var sf = 0;
     while (sf < 16) : (sf += 1) {
-        @setEvalBranchQuota(2000);
+        @setEvalBranchQuota(1500);
         const scale_factor = @round(std.math.pow(f32, @as(f32, sf + 1), 2.75));
         var qr = 0;
         while (qr < 8) : (qr += 1) {
@@ -28,7 +29,7 @@ const dequant_tab: [16][8]i16 = blk: {
     break :blk array;
 };
 
-inline fn dequant(scale_factor_quant: u4) f32 {
+fn dequant(scale_factor_quant: u4) f32 {
     const scale_factor: f32 = @floatFromInt(@as(u8, scale_factor_quant) + 1);
     return @round(std.math.pow(f32, scale_factor, 2.75));
 }
@@ -58,12 +59,13 @@ pub const Iter = struct {
     samples_remaining_in_frame: i32,
 
     // Some useful data for reencoding or using the data in some way
+
     sample_count: u32,
     sample_rate: u24,
     channel_count: u8,
 
     /// Returns the total 16bit samples the iterator will produce.
-    pub inline fn totalSamples(self: *const Iter) usize {
+    pub fn totalSamples(self: *const Iter) usize {
         return @as(usize, self.sample_count) * @as(usize, self.channel_count);
     }
 
@@ -113,20 +115,7 @@ pub const Iter = struct {
         var slice = (try self.nextSlice()) orelse return null;
         const lms = &self.lms_states[self.channel_no];
 
-        const sf: u4 = @truncate(slice >> 60);
-        slice <<= @bitSizeOf(@TypeOf(sf));
-
-        for (&self.decoded_sample_buffer) |*sample| {
-            const qr: u3 = @truncate(slice >> 61);
-
-            const dequantized = @as(i32, dequant_tab[sf][qr]);
-            const predicted = lms.predict();
-            const reconstructed = std.math.lossyCast(i16, predicted + dequantized);
-
-            sample.* = reconstructed;
-            slice <<= @bitSizeOf(@TypeOf(qr));
-            lms.update(dequantized, reconstructed);
-        }
+        decodeSlice(&slice, lms, &self.decoded_sample_buffer);
 
         if (self.samples_remaining_in_frame >= 0) {
             @branchHint(.likely);
@@ -193,18 +182,19 @@ pub const Iter = struct {
             self.lms_states[i] = try .take(self.reader);
         }
 
-        const SampleType = @TypeOf(self.samples_remaining_in_frame);
-        if (max_samples_in_frame > std.math.maxInt(SampleType) or
-            max_samples_in_frame < std.math.minInt(SampleType))
+        const Int = @TypeOf(self.samples_remaining_in_frame);
+        if (max_samples_in_frame > std.math.maxInt(Int) or
+            max_samples_in_frame < std.math.minInt(Int))
         {
-            @compileError("");
+            @compileError("Casting num samples might overflow for " ++ @typeName(Int));
         }
+
         const total_samples = std.math.mulWide(u16, header.samples_per_channel, header.channel_count);
         if (total_samples > max_samples_in_frame) {
             std.debug.panic("sample per channel is too wide: {}", .{total_samples});
         }
 
-        self.samples_remaining_in_frame = @as(i32, header.samples_per_channel) * header.channel_count;
+        self.samples_remaining_in_frame = @as(Int, header.samples_per_channel) * header.channel_count;
         self.slice_no = 0;
         self.channel_no = 0;
 
@@ -229,21 +219,21 @@ pub const FrameHeader = packed struct(u64) {
 
     const backing_size = @sizeOf(@typeInfo(FrameHeader).@"struct".backing_integer.?);
 
-    inline fn take(
+    fn take(
         reader: *std.Io.Reader,
     ) error{ ReadFailed, EndOfStream }!FrameHeader {
         const next_header_slice: [8]u8 = (try reader.takeArray(backing_size)).*;
         return .fromBytes(next_header_slice);
     }
 
-    inline fn peek(
+    fn peek(
         reader: *std.Io.Reader,
     ) error{ ReadFailed, EndOfStream }!FrameHeader {
         const next_header_slice: [8]u8 = (try reader.peekArray(backing_size)).*;
         return .fromBytes(next_header_slice);
     }
 
-    inline fn fromBytes(bytes: [8]u8) FrameHeader {
+    fn fromBytes(bytes: [8]u8) FrameHeader {
         if (endianess != .big) @compileError("bruh");
         const btn = std.mem.bigToNative;
 
@@ -268,7 +258,7 @@ pub fn fromReader(
     errdefer alloc.free(sample_buf);
 
     std.log.err(
-        "sizeof iterator size={}b align={}",
+        "sizeof iterator size={} (bytes) align={}",
         .{ @sizeOf(Iter), @alignOf(Iter) },
     );
 
@@ -279,10 +269,6 @@ pub fn fromReader(
     }
 
     std.debug.assert(samples.capacity == samples.items.len);
-
-    while (try iter.next()) |another_slice| {
-        std.debug.print("what the hell?? {any}\n", .{another_slice});
-    }
 
     return QOA{
         .sample_rate = iter.sample_rate,
@@ -297,14 +283,13 @@ const LMSState = struct {
 
     const zero: @Vector(4, i32) = @splat(0);
 
-    inline fn take(
+    fn take(
         reader: *std.Io.Reader,
     ) error{ ReadFailed, EndOfStream }!LMSState {
         const LMSStateEncoded = extern struct {
             history: [4]i16,
             weights: [4]i16,
         };
-
         const lms = try reader.takeStruct(LMSStateEncoded, endianess);
 
         return .{
@@ -313,7 +298,7 @@ const LMSState = struct {
         };
     }
 
-    inline fn predict(self: LMSState) i32 {
+    fn predict(self: LMSState) i32 {
         return @reduce(.Add, self.history *% self.weights) >> 13;
     }
 
@@ -322,33 +307,62 @@ const LMSState = struct {
         dequantized: i32,
         reconstructed: i16,
     ) void {
-        self.updateWeights(dequantized);
-        self.updateHistory(reconstructed);
-    }
-
-    inline fn updateWeights(
-        self: *LMSState,
-        dequantized: i32,
-    ) void {
-        const dlt: @Vector(4, i32) = @splat(dequantized >> 4);
-
+        const dlta: @Vector(4, i32) = @splat(dequantized >> 4);
         self.weights = @select(
             i32,
             self.history < zero,
-            self.weights -% dlt,
-            self.weights +% dlt,
+            self.weights - dlta,
+            self.weights + dlta,
         );
-    }
 
-    inline fn updateHistory(
-        self: *LMSState,
-        output_sample: i16,
-    ) void {
         self.history = @shuffle(
             i32,
             self.history,
-            @Vector(1, i32){output_sample},
+            @Vector(1, i32){reconstructed},
             @Vector(4, i32){ 1, 2, 3, -1 },
         );
     }
 };
+
+fn clamp(value: i32) i16 {
+    const u16max = std.math.maxInt(u16);
+    const i16max = std.math.maxInt(i16);
+    const i16min = std.math.minInt(i16);
+
+    std.debug.assert(value < std.math.maxInt(@TypeOf(value)) - i16max);
+
+    // NOTE: this check is the same as checking that the value is out of range
+    // for an i16:
+    // 1. When value < i16min then the bitcast for value + i16max underflows and thus is > u16max
+    // 2. When value > i16max then value + i16max > 2*i16max and u16max=2*i16max
+    if (@as(u32, @bitCast((value + i16max))) > u16max) {
+        @branchHint(.unlikely);
+        if (value < i16min) return i16min;
+        if (value > i16max) return i16max;
+    }
+
+    return @intCast(value);
+}
+
+/// Requires the buffer to have size at of at least `20`.
+/// NOTE: Always overwrites the entire `sample_buf`.
+pub fn decodeSlice(
+    slice: *u64,
+    lms: *LMSState,
+    sample_buf: *[num_samples_in_slice]i16,
+) void {
+    const sf: u4 = @truncate(slice.* >> 60);
+    slice.* <<= @bitSizeOf(@TypeOf(sf));
+
+    // PERF: Inline? needs a test
+    for (0..num_samples_in_slice) |i| {
+        const qr: u3 = @truncate(slice.* >> 61);
+        const dequantized = dequant_tab[sf][qr];
+        const predicted = lms.predict();
+        const reconstructed = clamp(dequantized + predicted);
+
+        sample_buf[i] = reconstructed;
+        slice.* <<= @bitSizeOf(@TypeOf(qr));
+        lms.update(dequantized, reconstructed);
+    }
+}
