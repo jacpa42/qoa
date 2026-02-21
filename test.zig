@@ -65,7 +65,10 @@ test "decode qoa header" {
 
 test "decode test files" {
     const alloc = std.testing.allocator;
-    const dir = try std.fs.cwd().openDir("test_files/", .{ .iterate = true });
+    const dir = try std.fs.cwd().openDir("test_files/", .{
+        .iterate = true,
+        .no_follow = true,
+    });
     var threads = std.ArrayList(std.Thread).empty;
     defer threads.deinit(alloc);
 
@@ -85,10 +88,17 @@ fn parseEveryQOAInDirRecursive(
     while (try iter.next()) |entry| switch (entry.kind) {
         .directory => {
             std.debug.print("dir {s}\n", .{entry.name});
-            const new_dir = try dir.openDir(entry.name, .{ .iterate = true });
+            const new_dir = try dir.openDir(entry.name, .{
+                .iterate = true,
+                .no_follow = true,
+            });
             try parseEveryQOAInDirRecursive(alloc, tasks, new_dir);
         },
         .file => if (std.mem.eql(u8, ".qoa", std.fs.path.extension(entry.name))) {
+            if (tasks.items.len > 6) {
+                for (tasks.items) |task| task.join();
+                tasks.clearRetainingCapacity();
+            }
             std.debug.print("Parsing {s}\n", .{entry.name});
             const file = try dir.openFile(entry.name, .{});
             const handle = try std.Thread.spawn(
