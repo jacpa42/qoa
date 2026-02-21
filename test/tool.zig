@@ -3,45 +3,15 @@ const qoa = @import("qoa");
 const zaudio = @import("zaudio");
 
 const sample_size = @sizeOf(i16);
+const playback = true;
 
 pub fn main() !void {
-    const path = blk: {
-        var args = std.process.args();
-        _ = args.next();
-        const path = args.next() orelse {
-            try printHelp();
-            return;
-        };
-        if (std.mem.startsWith(u8, trim(path), "-h") or
-            std.mem.startsWith(u8, trim(path), "--h"))
-        {
-            try printHelp();
-            return;
-        }
-        break :blk path;
-    };
+    const alloc = std.heap.c_allocator;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
-    defer if (gpa.deinit() == .leak) std.debug.print("Memory leak detected!", .{});
-    const alloc = gpa.allocator();
+    const args = (try parseArgs()) orelse return;
+    const path = args.inpath;
 
-    const sound = blk: {
-        const parse_start = std.time.Instant.now() catch unreachable;
-        defer {
-            const parse_end = std.time.Instant.now() catch unreachable;
-            std.log.info("Parsed in {:.2}ms\n", .{
-                @as(f32, @floatFromInt(parse_end.since(parse_start))) / std.time.ns_per_ms,
-            });
-        }
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
-
-        var reader_buf: [1024]u8 = undefined;
-        var file_reader = file.reader(&reader_buf);
-
-        std.log.info("parsing file {s}\n", .{path});
-        break :blk try qoa.decodeReader(alloc, &file_reader.interface);
-    };
+    const sound = try loadSoundIntoMemory(alloc, path);
     defer sound.deinit(alloc);
 
     std.log.info(
@@ -58,10 +28,9 @@ pub fn main() !void {
         sound.samples.len / (sound.sample_rate_hz * std.time.s_per_min),
     });
 
-    zaudio.init(alloc);
-    defer zaudio.deinit();
-
-    {
+    if (playback) {
+        zaudio.init(alloc);
+        defer zaudio.deinit();
         const as_bytes: [*]u8 = @ptrCast(sound.samples.ptr);
         var qoa_data_reader = std.Io.Reader.fixed(as_bytes[0 .. sample_size * sound.samples.len]);
         // device
@@ -116,6 +85,7 @@ fn printHelp() !void {
         \\      tool [options] input-file
         \\OPTIONS
         \\      --help, -h    print this menu and exit
+        \\
     );
     try writer.interface.flush();
 }
@@ -142,4 +112,48 @@ pub fn onFree(ptr: ?*anyopaque, user_data: ?*anyopaque) callconv(.c) void {
         const allocator: *std.mem.Allocator = @ptrCast(user_data.?);
         allocator.free(nonnull);
     }
+}
+
+const Args = struct {
+    inpath: [:0]const u8,
+};
+
+fn parseArgs() !?Args {
+    var args = std.process.args();
+    _ = args.next();
+    const path = args.next() orelse {
+        try printHelp();
+        return null;
+    };
+    if (std.mem.startsWith(u8, trim(path), "-h") or
+        std.mem.startsWith(u8, trim(path), "--h"))
+    {
+        try printHelp();
+        return null;
+    }
+    return Args{ .inpath = path };
+}
+
+fn loadSoundIntoMemory(
+    alloc: std.mem.Allocator,
+    path: [:0]const u8,
+) !qoa {
+    const parse_start = std.time.Instant.now() catch unreachable;
+    defer {
+        const parse_end = std.time.Instant.now() catch unreachable;
+        std.log.info("Parsed in {:.2}ms", .{
+            @as(f32, @floatFromInt(parse_end.since(parse_start))) / std.time.ns_per_ms,
+        });
+    }
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    var reader_buf: [1024]u8 = undefined;
+    var file_reader = file.reader(&reader_buf);
+    var list = std.ArrayList(u8).empty;
+    try file_reader.interface.appendRemaining(alloc, &list, .unlimited);
+    defer list.deinit(alloc);
+
+    std.log.info("parsing file {s}", .{path});
+    return qoa.decodeSlice(alloc, list.items);
 }

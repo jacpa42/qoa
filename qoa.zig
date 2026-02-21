@@ -3,7 +3,7 @@ const std = @import("std");
 const qoa = @This();
 
 const magic: [4]u8 = "qoaf".*;
-const max_decode_channels = 32;
+const max_decode_channels = 8;
 const max_slices_per_frame = 256;
 const num_samples_in_slice = 20;
 const max_samples_in_frame = max_slices_per_frame * num_samples_in_slice * max_decode_channels;
@@ -217,7 +217,7 @@ pub const Slice = struct {
     }
 };
 
-const DecodeError = error{
+pub const DecodeError = error{
     EndOfStream,
     ExceededMaxDecodeChannels,
     InvalidFileFormat,

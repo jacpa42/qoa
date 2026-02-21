@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
     });
 
     makeTests(b, modqoa, .{ .target = target, .optimize = optimize });
-    makePlaybackTool(b, modqoa, .{ .target = target, .optimize = optimize });
+    makePlaybackTool(b, modqoa, target);
 }
 
 fn makeTests(
@@ -36,27 +36,33 @@ fn makeTests(
 fn makePlaybackTool(
     b: *std.Build,
     qoa: *std.Build.Module,
-    args: anytype,
+    target: std.Build.ResolvedTarget,
 ) void {
-    const zaudio = b.dependency("zaudio", .{});
+    inline for (@typeInfo(std.builtin.OptimizeMode).@"enum".fields) |ef| {
+        const zaudio = b.dependency("zaudio", .{
+            .target = target,
+            .optimize = @as(std.builtin.OptimizeMode, @enumFromInt(ef.value)),
+        });
+        const tool_exe = b.addExecutable(.{
+            .name = "tool_" ++ ef.name,
+            .root_module = b.addModule("tool", .{
+                .root_source_file = b.path("test/tool.zig"),
+                .target = target,
+                .optimize = @enumFromInt(ef.value),
 
-    const tool_exe = b.addExecutable(.{
-        .name = "tool",
-        .root_module = b.addModule("tool", .{
-            .root_source_file = b.path("test/tool.zig"),
-            .target = args.target,
-            .optimize = args.optimize,
-            .imports = &.{
-                .{ .name = "qoa", .module = qoa },
-                .{ .name = "zaudio", .module = zaudio.module("root") },
-            },
-        }),
-    });
-    tool_exe.linkLibrary(zaudio.artifact("miniaudio"));
+                .imports = &.{
+                    .{ .name = "qoa", .module = qoa },
+                    .{ .name = "zaudio", .module = zaudio.module("root") },
+                },
+            }),
+        });
+        tool_exe.linkLibrary(zaudio.artifact("miniaudio"));
 
-    const tool_step = b.step("tool", "Use playback tool (-h for usage)");
-    const run_tool = b.addRunArtifact(tool_exe);
-    if (b.args) |cmdargs| run_tool.addArgs(cmdargs);
-    tool_step.dependOn(&run_tool.step);
-    b.installArtifact(tool_exe);
+        const tool_step = b.step("tool_" ++ ef.name, "Use playback tool (-h for usage)");
+        const run_tool = b.addRunArtifact(tool_exe);
+        if (b.args) |cmdargs| run_tool.addArgs(cmdargs);
+        tool_step.dependOn(&run_tool.step);
+        b.installArtifact(tool_exe);
+        tool_step.dependOn(b.getInstallStep());
+    }
 }

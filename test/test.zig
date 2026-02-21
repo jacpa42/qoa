@@ -40,7 +40,7 @@ test "decode qoa header" {
             rng.bytes(&buf);
             header_buf = buf[0..];
             reader = .fixed(header_buf);
-            try assertEq(qoa.Header.decode(&reader), error.InvalidFileFormat);
+            try assertEq(qoa.Header.decode(&reader), error.EndOfStream);
         }
 
         // too small
@@ -50,7 +50,7 @@ test "decode qoa header" {
             rng.bytes(&buf);
             header_buf = buf[0..];
             reader = .fixed(header_buf);
-            try assertEq(qoa.Header.decode(&reader), error.InvalidFileFormat);
+            try assertEq(qoa.Header.decode(&reader), error.EndOfStream);
         }
 
         // no magic
@@ -65,7 +65,7 @@ test "decode qoa header" {
 
 test "decode test files" {
     const alloc = std.testing.allocator;
-    const dir = try std.fs.cwd().openDir("test/test_files/", .{
+    const dir = try std.fs.cwd().openDir("test/test_files/songs", .{
         .iterate = true,
         .no_follow = true,
     });
