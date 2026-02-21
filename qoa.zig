@@ -76,42 +76,38 @@ pub const Frame = struct {
         sample_list: *std.ArrayList(i16),
     ) Frame.DecodeError!void {
         // read the frame header
-        const frame_header = try Frame.Header.decode(reader);
+        const header = try Frame.Header.decode(reader);
 
-        if (frame_header.num_channels > max_decode_channels) {
-            @branchHint(.unlikely);
-            return error.ExceededMaxDecodeChannels;
-        }
-
-        const lms_states = lms_state_buf[0..frame_header.num_channels];
+        // Decode the lms states
+        const lms_states = lms_state_buf[0..header.num_channels];
+        for (lms_states) |*lms| lms.* = try .decode(reader);
 
         var samples_computed: u32 = 0;
-        const total_samples_in_frame: u32 = std.math.mulWide(
-            u16,
-            frame_header.samples_per_channel,
-            frame_header.num_channels,
-        );
+        const total_samples_in_frame =
+            @as(u32, header.samples_per_channel) *
+            @as(u32, header.num_channels);
 
         std.debug.assert(sample_list.capacity - sample_list.items.len > total_samples_in_frame);
         const samples = sample_list.addManyAsSliceAssumeCapacity(total_samples_in_frame);
 
-        // read the LMS history & weights for this channel
-        for (lms_states) |*lms_state| lms_state.* = try .decode(reader);
-
-        const samples_per_frame = num_samples_in_slice * frame_header.num_channels;
-
         while (samples_computed < total_samples_in_frame) {
-            defer samples_computed += samples_per_frame;
+            // each frame we compute num_channels * num_samples_in_slice total samples
+            defer samples_computed +=
+                num_samples_in_slice *
+                header.num_channels;
 
-            for (0..frame_header.num_channels) |channel_no| {
+            for (0..header.num_channels) |channel_no| {
                 var slice = try Slice.decode(reader);
                 const sf_quant: u4 = @truncate(slice >> 60);
                 slice <<= 4;
 
                 var sample_index = samples_computed + channel_no;
-                const slice_end = @min(sample_index + samples_per_frame, total_samples_in_frame);
+                const slice_end = @min(
+                    sample_index + num_samples_in_slice * header.num_channels,
+                    total_samples_in_frame,
+                );
 
-                while (sample_index < slice_end) : (sample_index += frame_header.num_channels) {
+                while (sample_index < slice_end) : (sample_index += header.num_channels) {
                     const predicted = lms_states[channel_no].predict();
                     const quantized: u3 = @truncate(slice >> 61);
                     const dequantized = @as(i32, dequant_tab[sf_quant][quantized]);
@@ -132,7 +128,11 @@ pub const Frame = struct {
         samples_per_channel: u16,
         frame_size: u16,
 
-        pub const DecodeError = error{ ReadFailed, EndOfStream };
+        pub const DecodeError = error{
+            ReadFailed,
+            EndOfStream,
+            ExceededMaxDecodeChannels,
+        };
 
         pub fn decode(
             reader: *std.Io.Reader,
@@ -144,17 +144,9 @@ pub const Frame = struct {
                 std.mem.byteSwapAllFields(Frame.Header, &header);
             }
 
-            return header;
-        }
-
-        pub fn peek(
-            reader: *std.Io.Reader,
-        ) Frame.Header.DecodeError!Frame.Header {
-            var header: Frame.Header =
-                @bitCast((try reader.peekArray(@sizeOf(Frame.Header))).*);
-
-            if (native_endian != .big) {
-                std.mem.byteSwapAllFields(Frame.Header, &header);
+            if (header.num_channels > max_decode_channels) {
+                @branchHint(.cold);
+                return error.ExceededMaxDecodeChannels;
             }
 
             return header;
@@ -200,8 +192,8 @@ pub const Frame = struct {
             reader: *std.Io.Reader,
         ) LmsState.DecodeError!LmsState {
             const T = extern struct {
-                history: @Vector(lms_len, i16),
-                weights: @Vector(lms_len, i16),
+                history: [lms_len]i16,
+                weights: [lms_len]i16,
             };
 
             const t = try reader.takeStruct(T, .big);
@@ -255,8 +247,11 @@ pub fn decodeReaderStatic(
 
     // Peek to get the sample rate
     const num_channels, const sample_rate_hz = blk: {
-        const header_data = try Frame.Header.peek(reader);
-
+        const F = packed struct(u32) { num_channels: u8, sample_rate_hz: u24 };
+        var header_data: F = @bitCast((try reader.peekArray(@sizeOf(F))).*);
+        if (native_endian != .big) {
+            std.mem.byteSwapAllFields(F, &header_data);
+        }
         break :blk .{ header_data.num_channels, header_data.sample_rate_hz };
     };
 
@@ -268,14 +263,30 @@ pub fn decodeReaderStatic(
     if (num_channels > max_decode_channels) return error.ExceededMaxDecodeChannels;
     var lms_states: [max_decode_channels]Frame.LmsState = undefined;
 
-    // This overshoots by a small amount depending on how many are in the final frame
-    const estimated_total_samples = num_frames * max_slices_per_frame * num_channels * num_samples_in_slice;
+    // This overshoots by a small amount depending on how many are in the final frame.
+    // Means we never grow capacity and do at most 1 realloc.
+    const estimated_total_samples =
+        num_frames *
+        max_slices_per_frame * // -> max slices
+        num_samples_in_slice * // -> max samples per frame
+        num_channels; // -> max total samples
+    std.log.info("estimated_total_samples: {}", .{estimated_total_samples});
+
     var sample_list = try std.ArrayList(i16).initCapacity(alloc, estimated_total_samples);
     errdefer sample_list.deinit(alloc);
 
     for (0..num_frames) |_| {
         try Frame.decode(reader, &lms_states, &sample_list);
     }
+
+    std.log.info(
+        "Filled {:.3}% of arraylist. Zeroing {}",
+        .{
+            @as(f32, @floatFromInt(100 * sample_list.items.len)) /
+                @as(f32, @floatFromInt(sample_list.capacity)),
+            sample_list.unusedCapacitySlice().len,
+        },
+    );
 
     return qoa{
         .num_channels = num_channels,
@@ -295,8 +306,12 @@ pub fn deinit(
 pub fn clamp(v: i32) i16 {
     if (@as(u32, @bitCast(v + 32768)) > 65535) {
         @branchHint(.unlikely);
-        if (v < -32768) return -32768;
-        if (v > 32767) return 32767;
+        if (v < -32768) {
+            return -32768;
+        }
+        if (v > 32767) {
+            return 32767;
+        }
     }
     return @intCast(v);
 }

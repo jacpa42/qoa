@@ -14,6 +14,7 @@ pub fn main() !void {
     }
 
     const sound = try loadSoundIntoMemory(alloc, args.inpath);
+
     defer sound.deinit(alloc);
 
     std.log.info(
@@ -173,10 +174,7 @@ fn loadSoundIntoMemory(
 
     var reader_buf: [1024]u8 = undefined;
     var file_reader = file.reader(&reader_buf);
-    var list = std.ArrayList(u8).empty;
-    try file_reader.interface.appendRemaining(alloc, &list, .unlimited);
-    defer list.deinit(alloc);
 
     std.log.info("parsing file {s}", .{path});
-    return qoa.decodeSlice(alloc, list.items);
+    return qoa.decodeReader(alloc, &file_reader.interface);
 }

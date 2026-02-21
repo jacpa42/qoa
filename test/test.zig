@@ -87,7 +87,6 @@ fn parseQOARecursive(
     var iter = dir.iterate();
     while (try iter.next()) |entry| switch (entry.kind) {
         .directory => {
-            std.debug.print("dir {s}\n", .{entry.name});
             const new_dir = try dir.openDir(entry.name, .{
                 .iterate = true,
                 .no_follow = true,
@@ -100,7 +99,6 @@ fn parseQOARecursive(
                 for (tasks.items) |task| task.join();
                 tasks.clearRetainingCapacity();
             }
-            std.debug.print("Parsing {s}\n", .{entry.name});
             const file = try dir.openFile(entry.name, .{});
             const handle = try std.Thread.spawn(
                 .{ .allocator = alloc },
