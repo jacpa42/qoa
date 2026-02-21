@@ -13,7 +13,7 @@ const max_decode_channels = 8;
 const num_samples_in_slice = 20;
 const max_samples_in_frame = 256 * num_samples_in_slice * max_decode_channels;
 const dequant_tab: [16][8]i16 = blk: {
-    // PERF: Precompute the dequant tab for epic speed-ups :)
+    // PERF: Pre-compute the de-quant tab for epic speed-ups :)
     const dt = [_]comptime_float{ 0.75, -0.75, 2.5, -2.5, 4.5, -4.5, 7, -7 };
     var array: [16][8]i16 = @splat(@splat(0));
     var sf = 0;
@@ -28,11 +28,6 @@ const dequant_tab: [16][8]i16 = blk: {
 
     break :blk array;
 };
-
-fn dequant(scale_factor_quant: u4) f32 {
-    const scale_factor: f32 = @floatFromInt(@as(u8, scale_factor_quant) + 1);
-    return @round(std.math.pow(f32, scale_factor, 2.75));
-}
 
 /// A decoded qoa file
 pub const QOA = struct {

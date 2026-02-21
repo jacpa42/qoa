@@ -7,3 +7,6 @@ images/
 **.qoa
 **qoaconv
 samples/
+qoa-specification.pdf
+qoa.c
+qoa.h
