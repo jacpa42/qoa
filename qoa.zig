@@ -1,17 +1,11 @@
 const std = @import("std");
 
-pub const DecodeError = error{
-    InvalidFileFormat,
-    ReadFailed,
-    EndOfStream,
-    OutOfMemory,
-};
+const QOA = @This();
 
-const magic = "qoaf";
-const endianess = std.builtin.Endian.big;
-const max_decode_channels = 8;
+const max_decode_channels = 32;
+const max_slices = 256;
 const num_samples_in_slice = 20;
-const max_samples_in_frame = 256 * num_samples_in_slice * max_decode_channels;
+const max_samples_in_frame = max_slices * num_samples_in_slice * max_decode_channels;
 const dequant_tab: [16][8]i16 = blk: {
     // PERF: Pre-compute the de-quant tab for epic speed-ups :)
     const dt = [_]comptime_float{ 0.75, -0.75, 2.5, -2.5, 4.5, -4.5, 7, -7 };
@@ -29,335 +23,366 @@ const dequant_tab: [16][8]i16 = blk: {
     break :blk array;
 };
 
-/// A decoded qoa file
-pub const QOA = struct {
-    sample_rate: u32,
-    channels: u32,
-    /// `sample_count = QOA.samples.len / QOA.channels`
-    samples: []i16,
+num_samples: u8,
+sample_rate_hz: u24,
+data: []i16,
 
-    pub fn deinit(
-        self: *QOA,
-        alloc: std.mem.Allocator,
-    ) void {
-        alloc.free(self.samples);
+pub const Header = packed struct(u64) {
+    magic: [4]u8, // = "qoaf";
+    samples: Samples,
+
+    const Samples = enum(u32) {
+        streaming = 0,
+        _,
+    };
+
+    pub const DecodeError = error{InvalidFileFormat};
+
+    pub fn decode(
+        reader: *std.Io.Reader,
+    ) Header.DecodeError!Header {
+        const expected_magic = "qoaf";
+        const magic = reader.takeArray(expected_magic.len) catch
+            return error.InvalidFileFormat;
+
+        if (!std.mem.eql(u8, expected_magic, magic)) return error.InvalidFileFormat;
+
+        const samples = reader.takeInt(u32, .big) catch
+            return error.InvalidFileFormat;
+
+        return Header{ .magic = expected_magic, .samples = samples };
+    }
+
+    test decode {
+        const assertEq = std.testing.expectEqualDeep;
+        var prng = std.Random.DefaultPrng.init(0);
+        const rng = prng.random();
+
+        var samples: u32 = undefined;
+        var header_buf: []const u8 = undefined;
+        var reader: std.Io.Reader = undefined;
+        var decoded: Header = undefined;
+
+        { // happy path
+            samples = rng.int(@TypeOf(samples));
+            header_buf = "qoaf" ++ std.mem.toBytes(std.mem.nativeToBig(@TypeOf(samples), samples));
+            reader = .fixed(header_buf);
+            decoded = try Header.decode(&reader);
+            assertEq(decoded, Header{ .magic = "qoaf", .samples = samples });
+
+            samples = rng.int(@TypeOf(samples));
+            header_buf = "qoaf" ++ std.mem.toBytes(std.mem.nativeToBig(@TypeOf(samples), samples));
+            reader = .fixed(header_buf);
+            decoded = try Header.decode(&reader);
+            assertEq(decoded, Header{ .magic = "qoaf", .samples = samples });
+
+            samples = rng.int(@TypeOf(samples));
+            header_buf = "qoaf" ++ std.mem.toBytes(std.mem.nativeToBig(@TypeOf(samples), samples));
+            reader = .fixed(header_buf);
+            decoded = try Header.decode(&reader);
+            assertEq(decoded, Header{ .magic = "qoaf", .samples = samples });
+        }
+
+        { // unhappy path
+            var buf: []u8 = undefined;
+
+            // too small
+            samples = rng.int(@TypeOf(samples));
+            buf = &([_]u8{0} ** 7);
+            header_buf = rng.bytes(buf);
+            reader = .fixed(header_buf);
+            assertEq(Header.decode(&reader), error.InvalidFileFormat);
+
+            // too small
+            samples = rng.int(@TypeOf(samples));
+            buf = &([_]u8{0} ** 2);
+            header_buf = rng.bytes(buf);
+            reader = .fixed(header_buf);
+            assertEq(Header.decode(&reader), error.InvalidFileFormat);
+
+            // no magic
+            samples = rng.int(@TypeOf(samples));
+            header_buf = "qafo" ++ std.mem.toBytes(std.mem.nativeToBig(@TypeOf(samples), samples));
+            reader = .fixed(header_buf);
+            assertEq(Header.decode(&reader), error.InvalidFileFormat);
+        }
     }
 };
 
-/// Wraps a standard Io.Reader for a qoa file and decodes and returns the sample slices of size 20
-pub const Iter = struct {
-    reader: *std.Io.Reader,
-    decoded_sample_buffer: [num_samples_in_slice]i16,
-    lms_states: [max_decode_channels]LMSState,
-    slice_no: u8,
-    channel_no: u8,
-    samples_remaining_in_frame: i32,
+pub const Frame = struct {
+    pub const Header = packed struct(u64) {
+        num_channels: u8,
+        sample_rate_hz: u24,
+        samples_per_channel: u16,
+        frame_size: u16,
 
-    // Some useful data for reencoding or using the data in some way
+        pub const DecodeError = error{ ReadFailed, EndOfStream };
 
-    sample_count: u32,
-    sample_rate: u24,
-    channel_count: u8,
+        pub fn decode(
+            reader: *std.Io.Reader,
+        ) Frame.Header.DecodeError!Frame.Header {
+            var header: Frame.Header =
+                @bitCast(try reader.takeArray(@sizeOf(Frame.Header)));
 
-    /// Returns the total 16bit samples the iterator will produce.
-    pub fn totalSamples(self: *const Iter) usize {
-        return @as(usize, self.sample_count) * @as(usize, self.channel_count);
-    }
+            if (std.mem.native_endian != .big) {
+                std.mem.byteSwapAllFields(Frame.Header, &header);
+            }
 
-    /// Returns some data about the file which can be stored by the caller ensure correctness for decoding and encoding.
-    /// Retains a pointer to the reader.
-    pub fn init(
-        reader: *std.Io.Reader,
-    ) error{ ReadFailed, EndOfStream, InvalidFileFormat }!Iter {
-        const file_header = try reader.takeStruct(Header, endianess);
-        if (!std.mem.eql(u8, magic, &file_header.magic)) return error.InvalidFileFormat;
-
-        // Take one frame header (any valid qoa file must have at least one frame)
-        const frame_header = try FrameHeader.peek(reader);
-
-        if (frame_header.channel_count == 0 or
-            frame_header.sample_rate == 0 or
-            file_header.samples == 0)
-        {
-            return error.InvalidFileFormat;
+            return header;
         }
 
-        std.log.info("QOA iter size   {}b align={}", .{ @sizeOf(Iter), @alignOf(Iter) });
-        std.log.info("QOA samples     {}", .{file_header.samples});
-        std.log.info("QOA sample rate {}", .{frame_header.sample_rate});
-        std.log.info("QOA channels    {}", .{frame_header.channel_count});
+        pub fn peek(
+            reader: *std.Io.Reader,
+        ) Frame.Header.DecodeError!Frame.Header {
+            var header: Frame.Header =
+                @bitCast(try reader.peekArray(@sizeOf(Frame.Header)));
 
-        return Iter{
-            .reader = reader,
-            .decoded_sample_buffer = @splat(0),
-            .lms_states = @splat(.{}),
-            .slice_no = 0,
-            .channel_no = 0,
-            .samples_remaining_in_frame = 0,
+            if (std.mem.native_endian != .big) {
+                std.mem.byteSwapAllFields(Frame.Header, &header);
+            }
 
-            .sample_count = file_header.samples,
-            .sample_rate = frame_header.sample_rate,
-            .channel_count = frame_header.channel_count,
-        };
-    }
-
-    /// Grabs the next slice and decodes it.
-    ///
-    /// NOTE: For the last slice in the file, it might contain some zeroed out samples.
-    pub fn next(
-        self: *Iter,
-    ) DecodeError!?[]i16 {
-        var slice = (try self.nextSlice()) orelse return null;
-        const lms = &self.lms_states[self.channel_no];
-
-        decodeSlice(&slice, lms, &self.decoded_sample_buffer);
-
-        if (self.samples_remaining_in_frame >= 0) {
-            @branchHint(.likely);
-            return &self.decoded_sample_buffer;
-        } else {
-            const valid_sample_len = self.samples_remaining_in_frame + num_samples_in_slice;
-
-            std.debug.assert(0 < valid_sample_len);
-            std.debug.assert(valid_sample_len < self.decoded_sample_buffer.len);
-
-            return self.decoded_sample_buffer[0..@as(usize, @intCast(valid_sample_len))];
+            return header;
         }
-    }
+    };
 
-    fn nextSlice(
-        self: *Iter,
-    ) DecodeError!?u64 {
-        if (self.samples_remaining_in_frame < 0) {
-            return null;
-        } else if (self.samples_remaining_in_frame == 0) {
-            const byte_stream_finished = try self.nextFrame();
-            if (byte_stream_finished) return null;
-        } else {
-            if (self.channel_no == self.channel_count - 1) {
-                self.channel_no = 0;
-                self.slice_no +%= 1;
-            } else {
-                self.channel_no += 1;
+    pub const LmsState = struct {
+        history: [4]i32,
+        weights: [4]i32,
+
+        pub const DecodeError = error{ ReadFailed, EndOfStream };
+
+        pub fn update(
+            self: *LmsState,
+            reconstructed: i32,
+            dequantized: i32,
+        ) void {
+            const delta = dequantized >> 4;
+            for (self.history, &self.weights) |h, *w| {
+                w.* +%= if (h < 0) -delta else delta;
+            }
+
+            {
+                self.history[0] = self.history[1];
+                self.history[1] = self.history[2];
+                self.history[2] = self.history[3];
+                self.history[3] = reconstructed;
             }
         }
 
-        const slice = try self.reader.takeInt(u64, endianess);
-        self.samples_remaining_in_frame -= num_samples_in_slice;
+        pub fn predict(self: LmsState) i32 {
+            var predicted: i32 = 0;
+            for (self.history, self.weights) |h, w| {
+                predicted +%= h *% w;
+            }
+            return predicted >> 13;
+        }
 
-        return slice;
-    }
+        /// Decodes as many `LmsState` values as requested.
+        pub fn decodeAll(
+            reader: *std.Io.Reader,
+            lms_states: []LmsState,
+        ) LmsState.DecodeError!void {
+            std.debug.assert(lms_states.len <= max_decode_channels);
 
-    const StreamFinished = bool;
+            for (lms_states) |*lms_state| {
+                lms_state.* = try LmsState.decode(reader);
+            }
+        }
 
-    fn nextFrame(
-        self: *Iter,
-    ) error{
+        pub fn decode(
+            reader: *std.Io.Reader,
+        ) LmsState.DecodeError!Frame.Header {
+            const Lms16 = extern struct {
+                history: [4]i16,
+                weights: [4]i16,
+            };
+            var lms16: Lms16 = @bitCast(try reader.takeArray(@sizeOf(Lms16)));
+
+            if (std.mem.native_endian != .big) {
+                std.mem.byteSwapAllFields(Lms16, &lms16);
+            }
+
+            var state: LmsState = undefined;
+            for (0.., lms16.history, lms16.weights) |i, h, w| {
+                state.history[i] = h;
+                state.weights[i] = w;
+            }
+            return state;
+        }
+    };
+
+    pub const DecodeError = error{
         ReadFailed,
         EndOfStream,
-        InvalidFileFormat,
-    }!StreamFinished {
-        const header = FrameHeader.take(self.reader) catch |err| {
-            if (err == error.EndOfStream) return true else return err;
-        };
+    };
 
-        if (header.channel_count != self.channel_count or
-            header.sample_rate != self.sample_rate)
-        {
-            std.log.err(
-                \\Found invalid frame header: {any}
-                \\Expected num_channels=={} and sample_rate=={}
-            ,
-                .{ header, self.channel_no, self.sample_rate },
-            );
-            return error.InvalidFileFormat;
-        }
-
-        for (0..self.channel_count) |i| {
-            self.lms_states[i] = try .take(self.reader);
-        }
-
-        const Int = @TypeOf(self.samples_remaining_in_frame);
-        if (max_samples_in_frame > std.math.maxInt(Int) or
-            max_samples_in_frame < std.math.minInt(Int))
-        {
-            @compileError("Casting num samples might overflow for " ++ @typeName(Int));
-        }
-
-        const total_samples = std.math.mulWide(u16, header.samples_per_channel, header.channel_count);
-        if (total_samples > max_samples_in_frame) {
-            std.debug.panic("sample per channel is too wide: {}", .{total_samples});
-        }
-
-        self.samples_remaining_in_frame = @as(Int, header.samples_per_channel) * header.channel_count;
-        self.slice_no = 0;
-        self.channel_no = 0;
-
-        return false;
-    }
-};
-
-pub const Header = extern struct {
-    magic: [magic.len]u8,
-    samples: u32,
-};
-
-/// This header is before each frame. All values expect `size` need to match frame to frame.
-pub const FrameHeader = packed struct(u64) {
-    channel_count: u8,
-    /// In hertz
-    sample_rate: u24,
-    /// Samples per channel in this frame
-    samples_per_channel: u16,
-    /// Frame size (including this header)
-    size: u16,
-
-    const backing_size = @sizeOf(@typeInfo(FrameHeader).@"struct".backing_integer.?);
-
-    fn take(
+    pub fn decode(
         reader: *std.Io.Reader,
-    ) error{ ReadFailed, EndOfStream }!FrameHeader {
-        const next_header_slice: [8]u8 = (try reader.takeArray(backing_size)).*;
-        return .fromBytes(next_header_slice);
+        lms_states: []LmsState,
+        sample_list: *std.ArrayList(i16),
+    ) Frame.DecodeError!void {
+        // read the frame header
+        const frame_header = try Frame.Header.decode(reader);
+        var samples_computed: u32 = 0;
+        const total_samples_in_frame: u32 = std.math.mulWide(
+            u16,
+            frame_header.samples_per_channel,
+            frame_header.num_channels,
+        );
+
+        std.debug.assert(sample_list.capacity - sample_list.items.len > total_samples_in_frame);
+
+        // read the LMS history & weights for this channel
+        try Frame.LmsState.decodeAll(reader, lms_states);
+
+        while (samples_computed < total_samples_in_frame) {
+            defer samples_computed += num_samples_in_slice;
+
+            for (0..frame_header.num_channels) |ch| {
+                var slice = try Slice.decode(reader);
+                const sf_quant: u4 = blk: {
+                    defer slice <<= 4;
+                    break :blk @truncate(slice >> 60);
+                };
+
+                for (0..num_samples_in_slice) |_| {
+                    const predicted = lms_states[ch].predict();
+                    const quantized = slice >> 61;
+                    const dequantized = @as(i32, dequant_tab[sf_quant][quantized]);
+                    const reconstructed = clamp(predicted + dequantized);
+
+                    try sample_list.appendBounded(reconstructed);
+
+                    slice <<= 3;
+                    lms_states[ch].update(reconstructed, dequantized);
+                }
+            }
+        }
     }
 
-    fn peek(
+    pub fn decodeAlloc(
+        alloc: std.mem.Allocator,
         reader: *std.Io.Reader,
-    ) error{ ReadFailed, EndOfStream }!FrameHeader {
-        const next_header_slice: [8]u8 = (try reader.peekArray(backing_size)).*;
-        return .fromBytes(next_header_slice);
-    }
+        lms_states: []LmsState,
+        sample_list: *std.ArrayList(i16),
+    ) (error{OutOfMemory} || Frame.DecodeError)!void {
+        // read the frame header
+        const frame_header = try Frame.Header.decode(reader);
+        var samples_computed: u32 = 0;
+        const total_samples_in_frame: u32 = std.math.mulWide(
+            u16,
+            frame_header.samples_per_channel,
+            frame_header.num_channels,
+        );
 
-    fn fromBytes(bytes: [8]u8) FrameHeader {
-        if (endianess != .big) @compileError("bruh");
-        const btn = std.mem.bigToNative;
+        try sample_list.ensureUnusedCapacity(alloc, total_samples_in_frame);
 
-        return FrameHeader{
-            .channel_count = bytes[0],
-            .sample_rate = btn(u24, @bitCast(bytes[1..4].*)),
-            .samples_per_channel = btn(u16, @bitCast(bytes[4..6].*)),
-            .size = btn(u16, @bitCast(bytes[6..8].*)),
-        };
+        // read the LMS history & weights for this channel
+        try Frame.LmsState.decodeAll(reader, lms_states);
+
+        while (samples_computed < total_samples_in_frame) {
+            defer samples_computed += num_samples_in_slice;
+
+            for (0..frame_header.num_channels) |ch| {
+                var slice = try Slice.decode(reader);
+                const sf_quant: u4 = blk: {
+                    defer slice <<= 4;
+                    break :blk @truncate(slice >> 60);
+                };
+
+                for (0..num_samples_in_slice) |_| {
+                    const predicted = lms_states[ch].predict();
+                    const quantized = slice >> 61;
+                    const dequantized = @as(i32, dequant_tab[sf_quant][quantized]);
+                    const reconstructed = clamp(predicted + dequantized);
+
+                    try sample_list.appendBounded(reconstructed);
+
+                    slice <<= 3;
+                    lms_states[ch].update(reconstructed, dequantized);
+                }
+            }
+        }
     }
 };
 
-/// Parses bytes from reader into `QOA`.
-///
-/// Contains at most 19 invalid samples (which are zeroed out according to the spec);
-pub fn fromReader(
+pub const Slice = struct {
+    pub const DecodeError = error{ ReadFailed, EndOfStream };
+    pub fn decode(reader: *std.Io.Reader) Slice.DecodeError!u64 {
+        return @bitCast(try reader.takeInt(u64, .big));
+    }
+};
+
+const DecodeError = error{
+    OutOfMemory,
+    ExceededMaxDecodeChannels,
+} || Header.DecodeError;
+
+pub fn decodeSlice(
+    alloc: std.mem.Allocator,
+    slice: []const u8,
+) DecodeError!QOA {
+    var reader = std.Io.Reader.fixed(slice);
+    return decodeReader(alloc, &reader);
+}
+
+pub fn decodeReader(
     alloc: std.mem.Allocator,
     reader: *std.Io.Reader,
 ) DecodeError!QOA {
-    var iter = try Iter.init(reader);
-    const sample_buf = try alloc.alloc(i16, iter.totalSamples());
-    errdefer alloc.free(sample_buf);
-
-    std.log.err(
-        "sizeof iterator size={} (bytes) align={}",
-        .{ @sizeOf(Iter), @alignOf(Iter) },
-    );
-
-    var samples = std.ArrayList(i16).initBuffer(sample_buf);
-
-    while (try iter.next()) |new_samples| {
-        try samples.appendSliceBounded(new_samples);
-    }
-
-    std.debug.assert(samples.capacity == samples.items.len);
-
-    return QOA{
-        .sample_rate = iter.sample_rate,
-        .channels = iter.channel_count,
-        .samples = sample_buf,
+    const header = try Header.decode(reader);
+    return switch (header.samples) {
+        .streaming => @panic("TODO: Implement streaming decoder"),
+        else => |samples| decodeReaderStatic(alloc, reader, samples),
     };
 }
 
-const LMSState = struct {
-    history: @Vector(4, i32) = zero,
-    weights: @Vector(4, i32) = zero,
+pub fn decodeReaderStatic(
+    alloc: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    header: Header,
+) DecodeError!QOA {
+    std.debug.assert(header.samples != .streaming);
+    std.debug.assert(@as(usize, header.samples) >= 1); // same as above :)
 
-    const zero: @Vector(4, i32) = @splat(0);
+    const num_frames: usize = 1 + @divFloor(@as(usize, header.samples) - 1, num_samples_in_slice);
 
-    fn take(
-        reader: *std.Io.Reader,
-    ) error{ ReadFailed, EndOfStream }!LMSState {
-        const LMSStateEncoded = extern struct {
-            history: [4]i16,
-            weights: [4]i16,
-        };
-        const lms = try reader.takeStruct(LMSStateEncoded, endianess);
+    // Peek to get the sample rate
+    const num_channels, const sample_rate_hz = blk: {
+        const header_data = try Frame.Header.peek(reader);
+        break :blk .{ header_data.num_channels, header_data.sample_rate_hz };
+    };
 
-        return .{
-            .history = @as(@Vector(4, i32), lms.history),
-            .weights = @as(@Vector(4, i32), lms.weights),
-        };
+    if (num_channels > max_decode_channels) return error.ExceededMaxDecodeChannels;
+    var buf: [max_decode_channels]Frame.LmsState = undefined;
+    const lms_states = buf[0..num_channels];
+
+    // This overshoots by a small amount depending on how many are in the final frame
+    const estimated_total_samples = num_frames * max_slices * num_channels;
+    var sample_list = try std.ArrayList(i16).initCapacity(alloc, estimated_total_samples);
+    errdefer sample_list.deinit(alloc);
+
+    for (0..num_frames) |_| {
+        try Frame.decode(reader, lms_states, &sample_list);
     }
 
-    fn predict(self: LMSState) i32 {
-        return @reduce(.Add, self.history *% self.weights) >> 13;
-    }
-
-    fn update(
-        self: *LMSState,
-        dequantized: i32,
-        reconstructed: i16,
-    ) void {
-        const dlta: @Vector(4, i32) = @splat(dequantized >> 4);
-        self.weights = @select(
-            i32,
-            self.history < zero,
-            self.weights - dlta,
-            self.weights + dlta,
-        );
-
-        self.history = @shuffle(
-            i32,
-            self.history,
-            @Vector(1, i32){reconstructed},
-            @Vector(4, i32){ 1, 2, 3, -1 },
-        );
-    }
-};
-
-fn clamp(value: i32) i16 {
-    const u16max = std.math.maxInt(u16);
-    const i16max = std.math.maxInt(i16);
-    const i16min = std.math.minInt(i16);
-
-    std.debug.assert(value < std.math.maxInt(@TypeOf(value)) - i16max);
-
-    // NOTE: this check is the same as checking that the value is out of range
-    // for an i16:
-    // 1. When value < i16min then the bitcast for value + i16max underflows and thus is > u16max
-    // 2. When value > i16max then value + i16max > 2*i16max and u16max=2*i16max
-    if (@as(u32, @bitCast((value + i16max))) > u16max) {
-        @branchHint(.unlikely);
-        if (value < i16min) return i16min;
-        if (value > i16max) return i16max;
-    }
-
-    return @intCast(value);
+    return QOA{
+        .num_samples = num_channels,
+        .sample_rate_hz = sample_rate_hz,
+        .data = try sample_list.toOwnedSlice(alloc),
+    };
 }
 
-/// Requires the buffer to have size at of at least `20`.
-/// NOTE: Always overwrites the entire `sample_buf`.
-pub fn decodeSlice(
-    slice: *u64,
-    lms: *LMSState,
-    sample_buf: *[num_samples_in_slice]i16,
-) void {
-    const sf: u4 = @truncate(slice.* >> 60);
-    slice.* <<= @bitSizeOf(@TypeOf(sf));
-
-    // PERF: Inline? needs a test
-    for (0..num_samples_in_slice) |i| {
-        const qr: u3 = @truncate(slice.* >> 61);
-        const dequantized = dequant_tab[sf][qr];
-        const predicted = lms.predict();
-        const reconstructed = clamp(dequantized + predicted);
-
-        sample_buf[i] = reconstructed;
-        slice.* <<= @bitSizeOf(@TypeOf(qr));
-        lms.update(dequantized, reconstructed);
+// Special clamp
+pub fn clamp(v: i32) i16 {
+    if (@as(u32, @bitCast(v + 32768)) > 65535) {
+        @branchHint(.unlikely);
+        if (v < -32768) return -32768;
+        if (v > 32767) return 32767;
     }
+    return @intCast(v);
+}
+
+test {
+    std.testing.refAllDecls(@This());
 }
