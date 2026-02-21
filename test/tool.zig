@@ -4,6 +4,11 @@ const zaudio = @import("zaudio");
 
 const sample_size = @sizeOf(i16);
 
+pub const std_options = std.Options{
+    // Set the log level to info
+    .log_level = .debug,
+};
+
 pub fn main() !void {
     const alloc = std.heap.c_allocator;
 

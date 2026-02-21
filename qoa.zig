@@ -87,7 +87,7 @@ pub const Frame = struct {
             @as(u32, header.samples_per_channel) *
             @as(u32, header.num_channels);
 
-        std.debug.assert(sample_list.capacity - sample_list.items.len > total_samples_in_frame);
+        std.debug.assert(sample_list.capacity - sample_list.items.len >= total_samples_in_frame);
         const samples = sample_list.addManyAsSliceAssumeCapacity(total_samples_in_frame);
 
         while (samples_computed < total_samples_in_frame) {
@@ -270,7 +270,11 @@ pub fn decodeReaderStatic(
         max_slices_per_frame * // -> max slices
         num_samples_in_slice * // -> max samples per frame
         num_channels; // -> max total samples
-    std.log.info("estimated_total_samples: {}", .{estimated_total_samples});
+
+    std.log.scoped(.qoa).info(
+        "Estimated memory: {:.4}MiB",
+        .{@as(f32, @floatFromInt(estimated_total_samples * @sizeOf(i16))) / (1024 * 1024)},
+    );
 
     var sample_list = try std.ArrayList(i16).initCapacity(alloc, estimated_total_samples);
     errdefer sample_list.deinit(alloc);
@@ -279,16 +283,17 @@ pub fn decodeReaderStatic(
         try Frame.decode(reader, &lms_states, &sample_list);
     }
 
-    std.log.info(
-        "Filled {:.3}% of arraylist. Zeroing {}",
+    std.log.scoped(.qoa).info(
+        "Filled {:.3}% of arraylist ({:.4}MiB left)",
         .{
-            @as(f32, @floatFromInt(100 * sample_list.items.len)) /
-                @as(f32, @floatFromInt(sample_list.capacity)),
-            sample_list.unusedCapacitySlice().len,
+            @as(f32, @floatFromInt(100 * sample_list.items.len)) / @as(f32, @floatFromInt(sample_list.capacity)),
+            @as(f32, @floatFromInt(
+                (sample_list.capacity - sample_list.items.len) * @sizeOf(i16),
+            )) / (1024 * 1024),
         },
     );
 
-    return qoa{
+    return .{
         .num_channels = num_channels,
         .sample_rate_hz = sample_rate_hz,
         .samples = try sample_list.toOwnedSlice(alloc),
@@ -302,16 +307,13 @@ pub fn deinit(
     alloc.free(self.samples);
 }
 
+const max = std.math.maxInt(i16);
+const min = std.math.minInt(i16);
 // Special clamp
 pub fn clamp(v: i32) i16 {
-    if (@as(u32, @bitCast(v + 32768)) > 65535) {
+    if (@as(u32, @bitCast(v + max + 1)) > 2 * max + 1) {
         @branchHint(.unlikely);
-        if (v < -32768) {
-            return -32768;
-        }
-        if (v > 32767) {
-            return 32767;
-        }
+        return @intCast(std.math.clamp(v, min, max));
     }
     return @intCast(v);
 }
