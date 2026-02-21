@@ -3,15 +3,17 @@ const qoa = @import("qoa");
 const zaudio = @import("zaudio");
 
 const sample_size = @sizeOf(i16);
-const playback = true;
 
 pub fn main() !void {
     const alloc = std.heap.c_allocator;
 
-    const args = (try parseArgs()) orelse return;
-    const path = args.inpath;
+    const args = parseArgs();
+    if (args.help) {
+        try printHelp();
+        return;
+    }
 
-    const sound = try loadSoundIntoMemory(alloc, path);
+    const sound = try loadSoundIntoMemory(alloc, args.inpath);
     defer sound.deinit(alloc);
 
     std.log.info(
@@ -28,7 +30,7 @@ pub fn main() !void {
         sound.samples.len / (sound.sample_rate_hz * std.time.s_per_min),
     });
 
-    if (playback) {
+    if (args.playback) {
         zaudio.init(alloc);
         defer zaudio.deinit();
         const as_bytes: [*]u8 = @ptrCast(sound.samples.ptr);
@@ -84,7 +86,8 @@ fn printHelp() !void {
         \\SYNOPSIS
         \\      tool [options] input-file
         \\OPTIONS
-        \\      --help, -h    print this menu and exit
+        \\      --help,     -h  Print this menu and exit
+        \\      --playback, -p  Play the audio file using zaudio
         \\
     );
     try writer.interface.flush();
@@ -115,23 +118,43 @@ pub fn onFree(ptr: ?*anyopaque, user_data: ?*anyopaque) callconv(.c) void {
 }
 
 const Args = struct {
+    help: bool,
+    playback: bool,
     inpath: [:0]const u8,
 };
 
-fn parseArgs() !?Args {
+fn parseArgs() Args {
     var args = std.process.args();
     _ = args.next();
-    const path = args.next() orelse {
-        try printHelp();
-        return null;
-    };
-    if (std.mem.startsWith(u8, trim(path), "-h") or
-        std.mem.startsWith(u8, trim(path), "--h"))
-    {
-        try printHelp();
-        return null;
+
+    var no_arg_provided = true;
+    var help = false;
+    var playback = false;
+    var inpath: [:0]const u8 = &.{};
+
+    while (args.next()) |arg| {
+        const trimmed = trim(arg);
+        if (std.mem.startsWith(u8, trimmed, "-h") or
+            std.mem.startsWith(u8, trimmed, "--h"))
+        {
+            no_arg_provided = false;
+            help = true;
+        } else if (std.mem.startsWith(u8, trimmed, "-p") or
+            std.mem.startsWith(u8, trimmed, "--p"))
+        {
+            no_arg_provided = false;
+            playback = true;
+        } else {
+            no_arg_provided = false;
+            inpath = arg;
+        }
     }
-    return Args{ .inpath = path };
+
+    return Args{
+        .help = help or no_arg_provided or inpath.len == 0,
+        .playback = playback,
+        .inpath = inpath,
+    };
 }
 
 fn loadSoundIntoMemory(
