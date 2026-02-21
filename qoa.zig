@@ -162,8 +162,8 @@ pub const Frame = struct {
     };
 
     pub const LmsState = struct {
-        history: [lms_len]i32,
-        weights: [lms_len]i32,
+        history: @Vector(lms_len, i32),
+        weights: @Vector(lms_len, i32),
 
         const lms_len = 4;
 
@@ -174,38 +174,39 @@ pub const Frame = struct {
             reconstructed_sample: i32,
             dequantized_residual: i32,
         ) void {
-            const delta = dequantized_residual >> 4;
-            for (0..lms_len) |i| {
-                self.weights[i] +%= if (self.history[i] < 0) -delta else delta;
-            }
+            const V = @Vector(lms_len, i32);
 
-            {
-                self.history[0] = self.history[1];
-                self.history[1] = self.history[2];
-                self.history[2] = self.history[3];
-                self.history[3] = reconstructed_sample;
-            }
+            const delta = dequantized_residual >> 4;
+            self.weights +%= @select(
+                i32,
+                self.history < @as(V, @splat(0)),
+                @as(V, @splat(-delta)),
+                @as(V, @splat(delta)),
+            );
+
+            self.history = @shuffle(
+                i32,
+                self.history,
+                @Vector(1, i32){reconstructed_sample},
+                @TypeOf(self.history){ 1, 2, 3, -1 },
+            );
         }
 
         pub fn predict(self: LmsState) i32 {
-            var predicted: i32 = 0;
-            for (self.history, self.weights) |h, w| {
-                predicted +%= h *% w;
-            }
-            return predicted >> 13;
+            return @reduce(.Add, self.history *% self.weights) >> 13;
         }
 
         pub fn decode(
             reader: *std.Io.Reader,
         ) LmsState.DecodeError!LmsState {
-            var state: LmsState = undefined;
-            for (0..lms_len) |i| {
-                state.history[i] = try reader.takeInt(i16, .big);
-            }
-            for (0..lms_len) |i| {
-                state.weights[i] = try reader.takeInt(i16, .big);
-            }
-            return state;
+            const T = extern struct {
+                history: @Vector(lms_len, i16),
+                weights: @Vector(lms_len, i16),
+            };
+
+            const t = try reader.takeStruct(T, .big);
+
+            return .{ .history = t.history, .weights = t.weights };
         }
     };
 };
