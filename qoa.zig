@@ -237,6 +237,10 @@ pub fn decodeReader(
     };
 }
 
+// TODO: Multithreading should be possible. I can break up the work into `n` chunks as each frame is a fixed size once I know the number of channels (except the final one).
+//
+// Break the workload of n-1 of the chunks into some threads. Decode the final chunk on the main thread. Join. la di da.
+// TODO: Figure out how many workers to create (might default to 4 or something idk need to test)
 pub fn decodeReaderStatic(
     alloc: std.mem.Allocator,
     reader: *std.Io.Reader,
