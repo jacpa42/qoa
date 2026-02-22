@@ -238,6 +238,36 @@ pub const DecodeError = error{
     ReadFailed,
 };
 
+/// Decodes directly from the file reader allocating once only for the sample data
+pub fn decodeFilePath(
+    alloc: std.mem.Allocator,
+    sub_path: [:0]const u8,
+) (DecodeError || std.fs.File.OpenError)!qoa {
+    var file = try std.fs.cwd().openFile(sub_path, .{});
+    var iobuf: [1024]u8 = undefined;
+    var reader = file.reader(&iobuf);
+    return decodeReader(alloc, &reader.interface);
+}
+
+const DecodeFilePathMultithreadError = DecodeError || std.fs.File.OpenError || std.Io.Reader.LimitedAllocError || std.Thread.SpawnError;
+
+/// Loads the whole file into memory and then decodes it via using a couple workers
+pub fn decodeFilePathMultithread(
+    alloc: std.mem.Allocator,
+    sub_path: [:0]const u8,
+    worker_thread_count: ?usize,
+) DecodeFilePathMultithreadError!qoa {
+    var file = try std.fs.cwd().openFile(sub_path, .{});
+    var iobuf: [1024]u8 = undefined;
+    var reader = file.reader(&iobuf);
+
+    var list = std.ArrayList(u8).empty;
+    defer list.deinit(alloc);
+    try reader.interface.appendRemaining(alloc, &list, .unlimited);
+
+    return decodeSliceMultithread(alloc, list.items, worker_thread_count);
+}
+
 pub fn decodeSlice(
     alloc: std.mem.Allocator,
     slice: []const u8,

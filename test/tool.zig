@@ -9,7 +9,7 @@ const log = std.log.scoped(.tool);
 pub fn main() !void {
     const alloc = std.heap.c_allocator;
 
-    const args = parseArgs();
+    const args = try parseArgs();
     if (args.help) {
         try printHelp();
         return;
@@ -17,9 +17,13 @@ pub fn main() !void {
 
     var sound: qoa = undefined;
     if (args.multithread) {
-        sound = try loadSoundIntoMemoryMultithreadSliced(alloc, args.inpath);
+        var thread_count: ?usize = null;
+        if (args.thread_count) |t| {
+            if (t > 0) thread_count = t;
+        }
+        sound = try loadSoundMultiThreaded(alloc, args.inpath, thread_count);
     } else {
-        sound = try loadSoundIntoMemory(alloc, args.inpath);
+        sound = try loadSound(alloc, args.inpath);
     }
     defer sound.deinit(alloc);
 
@@ -96,6 +100,7 @@ fn printHelp() !void {
         \\OPTIONS
         \\      --help,        -h  Print this menu and exit
         \\      --multithread, -m  Use the multithreaded decoder
+        \\      --threads,     -t  The number of worker threads to use with the --multithread option
         \\      --playback,    -p  Play the audio file using zaudio
         \\
     );
@@ -129,23 +134,29 @@ pub fn onFree(ptr: ?*anyopaque, user_data: ?*anyopaque) callconv(.c) void {
 const Args = struct {
     help: bool,
     playback: bool,
+    thread_count: ?u8,
     multithread: bool,
     inpath: [:0]const u8,
 };
 
-fn parseArgs() Args {
+const Error = error{
+    ExpectedThreadCountValue,
+} || std.fmt.ParseIntError;
+
+fn parseArgs() Error!Args {
     var args = std.process.args();
     _ = args.next();
 
     var no_arg_provided = true;
     var help = false;
+    var thread_count: ?u8 = null;
     var multithread = false;
     var playback = false;
     var inpath: [:0]const u8 = &.{};
 
     while (args.next()) |arg| {
         no_arg_provided = false;
-        const trimmed = trim(arg);
+        var trimmed = trim(arg);
         if (std.mem.startsWith(u8, trimmed, "-h") or
             std.mem.startsWith(u8, trimmed, "--h"))
         {
@@ -158,6 +169,27 @@ fn parseArgs() Args {
             std.mem.startsWith(u8, trimmed, "--m"))
         {
             multithread = true;
+        } else if (std.mem.startsWith(u8, trimmed, "-t") or
+            std.mem.startsWith(u8, trimmed, "--t"))
+        {
+            if (std.mem.indexOfScalar(u8, trimmed, '=')) |eql| {
+                thread_count = std.fmt.parseInt(u8, trimmed[eql + 1 ..], 10) catch |e| {
+                    log.err("Failed to parse \"{s}\" into thread count {s}", .{ trimmed[eql + 1 ..], @errorName(e) });
+                    return e;
+                };
+            } else { // must be next arg
+                const next = args.next() orelse {
+                    const e = error.ExpectedThreadCountValue;
+                    log.err("Failed to parse thread count {s}", .{@errorName(e)});
+                    return e;
+                };
+                trimmed = trim(next);
+
+                thread_count = std.fmt.parseInt(u8, trimmed, 10) catch |e| {
+                    log.err("Failed to parse \"{s}\" into thread count {s}", .{ trimmed, @errorName(e) });
+                    return e;
+                };
+            }
         } else {
             inpath = arg;
         }
@@ -166,12 +198,13 @@ fn parseArgs() Args {
     return Args{
         .help = help or no_arg_provided or inpath.len == 0,
         .multithread = multithread,
+        .thread_count = thread_count,
         .playback = playback,
         .inpath = inpath,
     };
 }
 
-fn loadSoundIntoMemory(
+fn loadSound(
     alloc: std.mem.Allocator,
     path: [:0]const u8,
 ) !qoa {
@@ -182,19 +215,15 @@ fn loadSoundIntoMemory(
             @as(f32, @floatFromInt(parse_end.since(parse_start))) / std.time.ns_per_ms,
         });
     }
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-
-    var reader_buf: [1024]u8 = undefined;
-    var file_reader = file.reader(&reader_buf);
 
     log.info("parsing file {s}", .{path});
-    return qoa.decodeReader(alloc, &file_reader.interface);
+    return qoa.decodeFilePath(alloc, path);
 }
 
-fn loadSoundIntoMemoryMultithreadSliced(
+fn loadSoundMultiThreaded(
     alloc: std.mem.Allocator,
     path: [:0]const u8,
+    threads: ?usize,
 ) !qoa {
     const parse_start = std.time.Instant.now() catch unreachable;
     defer {
@@ -203,13 +232,7 @@ fn loadSoundIntoMemoryMultithreadSliced(
             @as(f32, @floatFromInt(parse_end.since(parse_start))) / std.time.ns_per_ms,
         });
     }
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
 
-    var reader_buf: [1024]u8 = undefined;
-    var file_reader = file.reader(&reader_buf);
-    const contents = try file_reader.interface.allocRemaining(alloc, .unlimited);
-
-    log.info("parsing file multithreaded {s}", .{path});
-    return qoa.decodeSliceMultithread(alloc, contents, null);
+    log.info("parsing file {s}", .{path});
+    return qoa.decodeFilePathMultithread(alloc, path, threads);
 }
