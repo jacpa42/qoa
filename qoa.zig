@@ -65,6 +65,7 @@ pub const Header = extern struct {
 
 pub const Frame = struct {
     pub const DecodeError = error{
+        OutOfMemory,
         ReadFailed,
         EndOfStream,
         ExceededMaxDecodeChannels,
@@ -87,7 +88,14 @@ pub const Frame = struct {
             @as(u32, header.samples_per_channel) *
             @as(u32, header.num_channels);
 
-        std.debug.assert(sample_list.capacity - sample_list.items.len >= total_samples_in_frame);
+        if ((sample_list.capacity - sample_list.items.len) < total_samples_in_frame) {
+            std.log.err("I need {} bytes, I have {} bytes\n", .{
+                total_samples_in_frame * 2,
+                (sample_list.capacity - sample_list.items.len) * 2,
+            });
+            return error.OutOfMemory;
+        }
+
         const samples = sample_list.addManyAsSliceAssumeCapacity(total_samples_in_frame);
 
         while (samples_computed < total_samples_in_frame) {
@@ -98,8 +106,8 @@ pub const Frame = struct {
 
             for (0..header.num_channels) |channel_no| {
                 var slice = try Slice.decode(reader);
-                const sf_quant: u4 = @truncate(slice >> 60);
-                slice <<= 4;
+                const sf_quant: u4 = @truncate(slice.data >> 60);
+                slice.data <<= 4;
 
                 var sample_index = samples_computed + channel_no;
                 const slice_end = @min(
@@ -109,13 +117,13 @@ pub const Frame = struct {
 
                 while (sample_index < slice_end) : (sample_index += header.num_channels) {
                     const predicted = lms_states[channel_no].predict();
-                    const quantized: u3 = @truncate(slice >> 61);
+                    const quantized: u3 = @truncate(slice.data >> 61);
                     const dequantized = @as(i32, dequant_tab[sf_quant][quantized]);
                     const reconstructed = clamp(predicted + dequantized);
 
                     samples[sample_index] = reconstructed;
 
-                    slice <<= 3;
+                    slice.data <<= 3;
                     lms_states[channel_no].update(reconstructed, dequantized);
                 }
             }
@@ -151,13 +159,43 @@ pub const Frame = struct {
 
             return header;
         }
+
+        pub fn peek(
+            reader: *std.Io.Reader,
+        ) Frame.Header.DecodeError!Frame.Header {
+            var header: Frame.Header =
+                @bitCast((try reader.peekArray(@sizeOf(Frame.Header))).*);
+
+            if (native_endian != .big) {
+                std.mem.byteSwapAllFields(Frame.Header, &header);
+            }
+
+            if (header.num_channels > max_decode_channels) {
+                @branchHint(.cold);
+                return error.ExceededMaxDecodeChannels;
+            }
+
+            return header;
+        }
+    };
+
+    const lms_len = 4;
+
+    /// This is how lms is stored in the file
+    pub const LmsState16 = extern struct {
+        history: [lms_len]i16,
+        weights: [lms_len]i16,
+
+        comptime {
+            if (@sizeOf(LmsState16) != lms_len * 2 * @sizeOf(i16)) {
+                @compileError("There can't be padding in this struct!");
+            }
+        }
     };
 
     pub const LmsState = struct {
         history: @Vector(lms_len, i32),
         weights: @Vector(lms_len, i32),
-
-        const lms_len = 4;
 
         pub const DecodeError = error{ ReadFailed, EndOfStream };
 
@@ -191,21 +229,16 @@ pub const Frame = struct {
         pub fn decode(
             reader: *std.Io.Reader,
         ) LmsState.DecodeError!LmsState {
-            const T = extern struct {
-                history: [lms_len]i16,
-                weights: [lms_len]i16,
-            };
-
-            const t = try reader.takeStruct(T, .big);
-
+            const t = try reader.takeStruct(LmsState16, .big);
             return .{ .history = t.history, .weights = t.weights };
         }
     };
 };
 
-pub const Slice = struct {
+pub const Slice = packed struct {
+    data: u64,
     pub const DecodeError = error{ ReadFailed, EndOfStream };
-    pub fn decode(reader: *std.Io.Reader) Slice.DecodeError!u64 {
+    pub fn decode(reader: *std.Io.Reader) Slice.DecodeError!Slice {
         return @bitCast(try reader.takeInt(u64, .big));
     }
 };
@@ -237,10 +270,6 @@ pub fn decodeReader(
     };
 }
 
-// TODO: Multithreading should be possible. I can break up the work into `n` chunks as each frame is a fixed size once I know the number of channels (except the final one).
-//
-// Break the workload of n-1 of the chunks into some threads. Decode the final chunk on the main thread. Join. la di da.
-// TODO: Figure out how many workers to create (might default to 4 or something idk need to test)
 pub fn decodeReaderStatic(
     alloc: std.mem.Allocator,
     reader: *std.Io.Reader,
@@ -302,6 +331,136 @@ pub fn decodeReaderStatic(
         .sample_rate_hz = sample_rate_hz,
         .samples = try sample_list.toOwnedSlice(alloc),
     };
+}
+
+// TODO: Multithreading should be possible. I can break up the work into `n` chunks as each frame is a fixed size once I know the number of channels (except the final one).
+//
+// Break the workload of n-1 of the chunks into some threads. Decode the final chunk on the main thread. Join. la di da.
+// TODO: Figure out how many workers to create (might default to 4 or something idk need to test)
+pub fn decodeSliceMultithread(
+    alloc: std.mem.Allocator,
+    data: []const u8,
+) (DecodeError || std.Thread.SpawnError)!qoa {
+    var reader = std.Io.Reader.fixed(data);
+    const file_header = try Header.decode(&reader);
+    const samples: u32 = switch (file_header.samples) {
+        .streaming => @panic("TODO: Implement streaming decoder"),
+        else => |samples| @intFromEnum(samples),
+    };
+
+    // Peek to get the next frame
+    const header = try Frame.Header.peek(&reader);
+
+    const num_frames: usize = 1 + @divFloor(
+        samples - 1,
+        num_samples_in_slice * max_slices_per_frame,
+    );
+    std.debug.print("total frames in file {}\n", .{num_frames});
+
+    // This overshoots by a small amount depending on how many are in the final frame.
+    // Means we never grow capacity and do at most 1 realloc.
+    const estimated_total_samples =
+        num_frames *
+        max_slices_per_frame * // -> max slices
+        num_samples_in_slice * // -> max samples per frame
+        header.num_channels; // -> max total samples
+
+    const bytes_per_frame: usize =
+        @sizeOf(Frame.Header) +
+        @sizeOf(Frame.LmsState16) * @as(usize, header.num_channels) +
+        @sizeOf(Slice) * @as(usize, header.num_channels) * max_slices_per_frame;
+
+    const num_background = 1;
+    const num_workers = 1 + num_background;
+    var worker_threads: [num_background]std.Thread = undefined;
+    var num_complete = std.atomic.Value(u8).init(0);
+
+    var sample_list = try std.ArrayList(i16).initCapacity(alloc, estimated_total_samples);
+    errdefer sample_list.deinit(alloc);
+
+    std.debug.assert(num_workers > 0);
+    const frames_per_worker = num_frames / num_workers;
+    if (frames_per_worker > 0) for (0..worker_threads.len) |worker_id| {
+        const samples_per_worker =
+            frames_per_worker *
+            max_slices_per_frame * num_samples_in_slice * // -> max samples per frame
+            header.num_channels; // 1 i16 per channel -> total length of output slice
+        const output_slice = try sample_list.addManyAsSliceBounded(samples_per_worker);
+
+        std.debug.print(
+            "Spawning thread id={} with outputslice = {}bytes for {} frames\n",
+            .{ worker_id, output_slice.len * 2, frames_per_worker },
+        );
+        std.debug.print(
+            "Remaining capacity in list: {}bytes\n\n",
+            .{sample_list.unusedCapacitySlice().len * 2},
+        );
+
+        worker_threads[worker_id] = try std.Thread.spawn(
+            .{ .allocator = alloc, .stack_size = 512 * 1024 },
+            decodeFrames,
+            .{ worker_id, reader, frames_per_worker, &num_complete, output_slice },
+        );
+
+        reader.toss(frames_per_worker * bytes_per_frame);
+    };
+
+    // We still have a few frames left to decode which we do on the main thread
+    {
+        const num_frames_remaining = num_frames - (frames_per_worker * num_background);
+        std.debug.print(
+            "number of frames remaining: {}\n",
+            .{num_frames_remaining},
+        );
+        var lms_state_buf: [max_decode_channels]Frame.LmsState = undefined;
+        for (0..num_frames_remaining) |frame_no| {
+            std.log.scoped(.worker).info("(id=main) frame_number: {}", .{frame_no});
+            Frame.decode(&reader, &lms_state_buf, &sample_list) catch |e| {
+                std.log.scoped(.worker).info(
+                    "(id=main) failed to decode frame {}: {s}",
+                    .{ frame_no, @errorName(e) },
+                );
+                return e;
+            };
+        }
+    }
+
+    std.debug.print("Main thread finished and {} workers finished\n", .{num_complete.load(.acquire)});
+
+    while (num_complete.load(.acquire) < num_background) {
+        std.Thread.sleep(std.time.ns_per_ms / 2);
+    }
+    for (worker_threads) |worker| worker.join();
+
+    return .{
+        .num_channels = header.num_channels,
+        .sample_rate_hz = header.sample_rate_hz,
+        .samples = try sample_list.toOwnedSlice(alloc),
+    };
+}
+
+fn decodeFrames(
+    worker_id: usize,
+    initial_reader: std.Io.Reader,
+    num_frames: usize,
+    incr_on_completion: *std.atomic.Value(u8),
+    output_slice: []i16,
+) DecodeError!void {
+    defer _ = incr_on_completion.fetchAdd(1, .acq_rel);
+    var reader = initial_reader;
+    var lms_state_buf: [max_decode_channels]Frame.LmsState = undefined;
+    var list = std.ArrayList(i16).initBuffer(output_slice);
+
+    for (0..num_frames) |frame_no| {
+        std.log.scoped(.worker).info("(id={}) frame_number: {}", .{ worker_id, frame_no });
+        Frame.decode(&reader, &lms_state_buf, &list) catch |e| {
+            std.log.scoped(.worker).err(
+                "(id={}) failed to decode frame {} with {} frames left: {s}",
+                .{ worker_id, frame_no, num_frames - frame_no, @errorName(e) },
+            );
+            return e;
+        };
+    }
 }
 
 pub fn deinit(
