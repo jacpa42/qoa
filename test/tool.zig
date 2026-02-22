@@ -16,8 +16,8 @@ pub fn main() !void {
     }
 
     var sound: qoa = undefined;
-    if (args.multithread) {
-        var thread_count: ?usize = null;
+    var thread_count: ?usize = null;
+    if (args.multithread or args.thread_count != null) {
         if (args.thread_count) |t| {
             if (t > 0) thread_count = t;
         }
@@ -30,6 +30,7 @@ pub fn main() !void {
     log.info(
         \\Finished parsing
         \\┌────────────────────────────────┐
+        \\│ num_threads    : {any:13} │
         \\│ num_channels   : {:13} │
         \\│ sample_rate_hz : {:13} │
         \\│ num_samples    : {:13} │
@@ -38,6 +39,7 @@ pub fn main() !void {
         \\└────────────────────────────────┘
         \\
     , .{
+        thread_count,
         sound.num_channels,
         sound.sample_rate_hz,
         sound.sample_list.items.len,
@@ -237,5 +239,5 @@ fn loadSoundMultiThreaded(
     }
 
     log.info("parsing file {s}", .{path});
-    return qoa.multithread.fromPath(alloc, path, threads);
+    return qoa.decode.multithread.fromPath(alloc, path, threads);
 }

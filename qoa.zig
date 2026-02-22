@@ -2,10 +2,9 @@ const std = @import("std");
 const consts = @import("src/constants.zig");
 const log = std.log.scoped(.qoa);
 
-pub const decode = @import("src/decode.zig");
-pub const multithread = @import("src/multithread.zig");
 pub const Frame = @import("src/Frame.zig");
 pub const Header = @import("src/Header.zig");
+pub const decode = @import("src/decode.zig");
 
 test {
     std.testing.refAllDecls(@This());
