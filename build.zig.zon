@@ -1,14 +1,14 @@
 .{
     .name = .qoa,
     .version = "0.0.1",
+    .fingerprint = 0x72a2fdd35e206f6c,
+    .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .zaudio = .{
             .url = "git+https://github.com/zig-gamedev/zaudio#bb93ad665b89e302d4515a36b44cb8e73eaf6766",
             .hash = "zaudio-0.11.0-dev-_M-91kHvPwAlW8MCRI4XiTbTeihqB8Zspgiuw-6Gqgdz",
         },
     },
-    .fingerprint = 0x72a2fdd35e206f6c,
-    .minimum_zig_version = "0.15.2",
     .paths = .{
         "build.zig",
         "build.zig.zon",
