@@ -1,7 +1,7 @@
 .{
     .name = .qoa,
-    .version = "0.0.1",
-    .fingerprint = 0x72a2fdd35e206f6c,
+    .version = "0.0.0",
+    .fingerprint = 0x72a2fdd306c40300,
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .zaudio = .{
