@@ -34,7 +34,7 @@ sample_rate_hz: u24,
 sample_list: std.ArrayList(i16),
 
 pub const Header = extern struct {
-    magic: [4]u8 = undefined,
+    magic: [4]u8,
     samples: Samples,
 
     pub const Samples = enum(u32) {
