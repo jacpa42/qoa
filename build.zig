@@ -4,14 +4,14 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const modqoa = b.addModule("root", .{
+    const qoa_mod = b.addModule("root", .{
         .root_source_file = b.path("qoa.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    makeTests(b, modqoa, .{ .target = target, .optimize = optimize });
-    makePlaybackTool(b, modqoa, .{ .target = target, .optimize = optimize });
+    makeTests(b, qoa_mod, .{ .target = target, .optimize = optimize });
+    makePlaybackTool(b, qoa_mod, .{ .target = target, .optimize = optimize });
 }
 
 fn makeTests(
