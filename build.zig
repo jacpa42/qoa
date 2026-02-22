@@ -48,6 +48,7 @@ fn makePlaybackTool(
             .root_source_file = b.path("test/tool.zig"),
             .target = args.target,
             .optimize = args.optimize,
+            .strip = args.optimize == .ReleaseFast or args.optimize == .ReleaseSmall,
 
             .imports = &.{
                 .{ .name = "qoa", .module = qoa },
@@ -55,6 +56,7 @@ fn makePlaybackTool(
             },
         }),
     });
+
     tool_exe.linkLibrary(zaudio.artifact("miniaudio"));
 
     const tool_step = b.step("tool", "Use playback tool (-h for usage)");

@@ -220,7 +220,7 @@ fn loadSound(
     }
 
     log.info("parsing file {s}", .{path});
-    return qoa.decodeFilePath(alloc, path);
+    return qoa.decode.fromPath(alloc, path);
 }
 
 fn loadSoundMultiThreaded(
@@ -237,5 +237,5 @@ fn loadSoundMultiThreaded(
     }
 
     log.info("parsing file {s}", .{path});
-    return qoa.decodeFilePathMultithread(alloc, path, threads);
+    return qoa.multithread.fromPath(alloc, path, threads);
 }
