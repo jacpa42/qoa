@@ -29,16 +29,19 @@ pub fn main() !void {
 
     log.info(
         \\Finished parsing
-        \\
-        \\ num_channels   : {}
-        \\ sample_rate_hz : {}
-        \\ num_samples    : {}
-        \\ song_duration  : {} minutes
+        \\┌────────────────────────────────┐
+        \\│ num_channels   : {:13} │
+        \\│ sample_rate_hz : {:13} │
+        \\│ num_samples    : {:13} │
+        \\│ buffer size    : {:9} MiB │
+        \\│ song_duration  : {:5} minutes │
+        \\└────────────────────────────────┘
         \\
     , .{
         sound.num_channels,
         sound.sample_rate_hz,
         sound.sample_list.items.len,
+        sound.sample_list.capacity * @sizeOf(i16) / (1024 * 1024),
         sound.sample_list.items.len / (sound.sample_rate_hz * std.time.s_per_min),
     });
 
