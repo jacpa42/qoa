@@ -4,15 +4,16 @@ const qoa = @This();
 
 const log = std.log.scoped(.qoa);
 
+const stack_size = 64 * 1024;
+const default_num_workers = 8;
+const native_endian = @import("builtin").cpu.arch.endian();
+
 const magic: [4]u8 = "qoaf".*;
-const default_num_background = 7;
 const max_decode_channels = 8;
 const max_slices_per_frame = 256;
 const num_samples_in_slice = 20;
 const max_samples_in_frame = max_slices_per_frame * num_samples_in_slice * max_decode_channels;
-const native_endian = @import("builtin").cpu.arch.endian();
 const dequant_tab: [16][8]i16 = blk: {
-    // PERF: Pre-compute the de-quant tab for epic speed-ups :)
     const dt = [_]comptime_float{ 0.75, -0.75, 2.5, -2.5, 4.5, -4.5, 7, -7 };
     var array: [16][8]i16 = @splat(@splat(0));
     var sf = 0;
@@ -30,7 +31,7 @@ const dequant_tab: [16][8]i16 = blk: {
 
 num_channels: u8,
 sample_rate_hz: u24,
-samples: []i16,
+sample_list: std.ArrayList(i16),
 
 pub const Header = extern struct {
     magic: [4]u8 = undefined,
@@ -74,51 +75,29 @@ pub const Frame = struct {
         ExceededMaxDecodeChannels,
     };
 
-    fn decode(
+    /// Called after decoding the header and LmsStates
+    pub fn decodeSlices(
         reader: *std.Io.Reader,
-        lms_state_buf: *[max_decode_channels]Frame.LmsState,
-        sample_list: *std.ArrayList(i16),
-    ) Frame.DecodeError!void {
-        // read the frame header
-        const header = try Frame.Header.decode(reader);
-
-        // Decode the lms states
-        const lms_states = lms_state_buf[0..header.num_channels];
-        for (lms_states) |*lms| lms.* = try .decode(reader);
-
+        lms_states: []Frame.LmsState,
+        num_channels: u8,
+        samples: []i16,
+    ) Frame.Slice.DecodeError!void {
         var samples_computed: u32 = 0;
-        const total_samples_in_frame =
-            @as(u32, header.samples_per_channel) *
-            @as(u32, header.num_channels);
+        const values_per_slice = num_samples_in_slice * num_channels;
 
-        if ((sample_list.capacity - sample_list.items.len) < total_samples_in_frame) {
-            log.err("I need {} bytes, I have {} bytes\n", .{
-                total_samples_in_frame * 2,
-                (sample_list.capacity - sample_list.items.len) * 2,
-            });
-            return error.OutOfMemory;
-        }
-
-        const samples = sample_list.addManyAsSliceAssumeCapacity(total_samples_in_frame);
-
-        while (samples_computed < total_samples_in_frame) {
+        while (samples_computed < samples.len) {
             // each frame we compute num_channels * num_samples_in_slice total samples
-            defer samples_computed +=
-                num_samples_in_slice *
-                header.num_channels;
+            defer samples_computed += values_per_slice;
 
-            for (0..header.num_channels) |channel_no| {
+            for (0..num_channels) |channel_no| {
                 var slice = try Slice.decode(reader);
                 const sf_quant: u4 = @truncate(slice.data >> 60);
                 slice.data <<= 4;
 
                 var sample_index = samples_computed + channel_no;
-                const slice_end = @min(
-                    sample_index + num_samples_in_slice * header.num_channels,
-                    total_samples_in_frame,
-                );
+                const slice_end = @min(sample_index + values_per_slice, samples.len);
 
-                while (sample_index < slice_end) : (sample_index += header.num_channels) {
+                while (sample_index < slice_end) : (sample_index += num_channels) {
                     const predicted = lms_states[channel_no].predict();
                     const quantized: u3 = @truncate(slice.data >> 61);
                     const dequantized = @as(i32, dequant_tab[sf_quant][quantized]);
@@ -132,6 +111,14 @@ pub const Frame = struct {
             }
         }
     }
+
+    pub const Slice = packed struct {
+        data: u64,
+        pub const DecodeError = error{ ReadFailed, EndOfStream };
+        pub fn decode(reader: *std.Io.Reader) Slice.DecodeError!Slice {
+            return @bitCast(try reader.takeInt(u64, .big));
+        }
+    };
 
     pub const Header = packed struct(u64) {
         num_channels: u8,
@@ -179,6 +166,11 @@ pub const Frame = struct {
             }
 
             return header;
+        }
+
+        /// Gets the size of the buffer required to allocate all the samples for the frame
+        fn getSampleSlice(frame_header: Frame.Header) usize {
+            return @as(usize, frame_header.samples_per_channel) * @as(usize, frame_header.num_channels);
         }
     };
 
@@ -238,14 +230,6 @@ pub const Frame = struct {
     };
 };
 
-pub const Slice = packed struct {
-    data: u64,
-    pub const DecodeError = error{ ReadFailed, EndOfStream };
-    pub fn decode(reader: *std.Io.Reader) Slice.DecodeError!Slice {
-        return @bitCast(try reader.takeInt(u64, .big));
-    }
-};
-
 pub const DecodeError = error{
     EndOfStream,
     ExceededMaxDecodeChannels,
@@ -276,10 +260,10 @@ pub fn decodeReader(
 pub fn decodeReaderStatic(
     alloc: std.mem.Allocator,
     reader: *std.Io.Reader,
-    samples: Header.Samples,
+    num_samples: Header.Samples,
 ) DecodeError!qoa {
-    std.debug.assert(samples != .streaming);
-    std.debug.assert(@as(usize, @intFromEnum(samples)) >= 1); // same as above :)
+    std.debug.assert(num_samples != .streaming);
+    std.debug.assert(@as(usize, @intFromEnum(num_samples)) >= 1); // same as above :)
 
     // Peek to get the sample rate
     const num_channels, const sample_rate_hz = blk: {
@@ -292,12 +276,12 @@ pub fn decodeReaderStatic(
     };
 
     const num_frames: usize = 1 + @divFloor(
-        @as(usize, @intFromEnum(samples)) - 1,
+        @as(usize, @intFromEnum(num_samples)) - 1,
         num_samples_in_slice * max_slices_per_frame,
     );
 
     if (num_channels > max_decode_channels) return error.ExceededMaxDecodeChannels;
-    var lms_states: [max_decode_channels]Frame.LmsState = undefined;
+    var lms_state_buf: [max_decode_channels]Frame.LmsState = undefined;
 
     // This overshoots by a small amount depending on how many are in the final frame.
     // Means we never grow capacity and do at most 1 realloc.
@@ -316,7 +300,18 @@ pub fn decodeReaderStatic(
     errdefer sample_list.deinit(alloc);
 
     for (0..num_frames) |_| {
-        try Frame.decode(reader, &lms_states, &sample_list);
+        // read the frame header
+        const header = try Frame.Header.decode(reader);
+
+        // Decode the lms states
+        const lms_states = lms_state_buf[0..header.num_channels];
+        for (lms_states) |*lms| lms.* = try .decode(reader);
+
+        // Get sample output slice
+        const frame_sample_count = header.getSampleSlice();
+        const samples = try sample_list.addManyAsSliceBounded(frame_sample_count);
+
+        try Frame.decodeSlices(reader, lms_states, header.num_channels, samples);
     }
 
     log.info(
@@ -332,17 +327,15 @@ pub fn decodeReaderStatic(
     return .{
         .num_channels = num_channels,
         .sample_rate_hz = sample_rate_hz,
-        .samples = try sample_list.toOwnedSlice(alloc),
+        .sample_list = sample_list,
     };
 }
 
-// TODO: Multithreading should be possible. I can break up the work into `n` chunks as each frame is a fixed size once I know the number of channels (except the final one).
-//
-// Break the workload of n-1 of the chunks into some threads. Decode the final chunk on the main thread. Join. la di da.
-// TODO: Figure out how many workers to create (might default to 4 or something idk need to test)
+/// pass `worker_thread_count` as `null` to try to use all cpu cores
 pub fn decodeSliceMultithread(
     alloc: std.mem.Allocator,
     data: []const u8,
+    worker_thread_count: ?usize,
 ) (DecodeError || std.Thread.SpawnError)!qoa {
     var reader = std.Io.Reader.fixed(data);
     const file_header = try Header.decode(&reader);
@@ -358,7 +351,6 @@ pub fn decodeSliceMultithread(
         samples - 1,
         num_samples_in_slice * max_slices_per_frame,
     );
-    log.info("total frames in file {}\n", .{num_frames});
 
     // This overshoots by a small amount depending on how many are in the final frame.
     // Means we never grow capacity and do at most 1 realloc.
@@ -371,63 +363,57 @@ pub fn decodeSliceMultithread(
     const bytes_per_frame: usize =
         @sizeOf(Frame.Header) +
         @sizeOf(Frame.LmsState16) * @as(usize, header.num_channels) +
-        @sizeOf(Slice) * @as(usize, header.num_channels) * max_slices_per_frame;
+        @sizeOf(Frame.Slice) * @as(usize, header.num_channels) * max_slices_per_frame;
 
-    const num_background = std.Thread.getCpuCount() catch |e| blk: {
-        log.warn("Unable to query number of cpus: {s}", .{@errorName(e)});
-        log.warn("Using default {}", .{default_num_background + 1});
-        break :blk default_num_background;
+    const num_workers: usize = blk: {
+        const num_workers = worker_thread_count orelse std.Thread.getCpuCount() catch |e| {
+            log.warn("Unable to query number of cpus: {s}", .{@errorName(e)});
+            log.warn("Using default {}", .{default_num_workers});
+            comptime if (default_num_workers <= 0) @compileError("default_num_workers must be > 0");
+            break :blk default_num_workers;
+        };
+        break :blk @max(num_workers, 1);
     };
-    const num_workers = 1 + num_background;
-    var worker_threads = try alloc.alloc(std.Thread, num_background);
-    defer alloc.free(worker_threads);
-    var num_complete = std.atomic.Value(u8).init(0);
+
+    var thread_buffer: [512]std.Thread = undefined;
+    if (num_workers > thread_buffer.len) return error.OutOfMemory;
+    var worker_threads = thread_buffer[0..num_workers];
 
     var sample_list = try std.ArrayList(i16).initCapacity(alloc, estimated_total_samples);
     errdefer sample_list.deinit(alloc);
 
     std.debug.assert(num_workers > 0);
     const frames_per_worker = num_frames / num_workers;
-    if (frames_per_worker > 0) for (0..worker_threads.len) |worker_id| {
+    var frames_per_worker_remainder = num_frames - num_workers * frames_per_worker;
+
+    log.info("total frames in file {}", .{num_frames});
+    log.info("total memory per thread ~{:.2}KiB", .{@as(f32, @floatFromInt((bytes_per_frame * frames_per_worker))) / 1024});
+
+    for (0..worker_threads.len) |worker_id| {
+        const add_one = @intFromBool(frames_per_worker_remainder == 0);
+        frames_per_worker_remainder -= add_one;
+
         const samples_per_worker =
-            frames_per_worker *
+            (frames_per_worker + add_one) *
             max_slices_per_frame * num_samples_in_slice * // -> max samples per frame
             header.num_channels; // 1 i16 per channel -> total length of output slice
         const output_slice = try sample_list.addManyAsSliceBounded(samples_per_worker);
 
         worker_threads[worker_id] = try std.Thread.spawn(
-            .{ .allocator = alloc, .stack_size = 512 * 1024 },
+            .{ .allocator = null, .stack_size = stack_size },
             decodeFrames,
-            .{ worker_id, reader, frames_per_worker, &num_complete, output_slice },
+            .{ worker_id, reader, frames_per_worker, output_slice },
         );
 
         reader.toss(frames_per_worker * bytes_per_frame);
-    };
-
-    // We still have a few frames left to decode which we do on the main thread
-    {
-        const num_frames_remaining = num_frames - (frames_per_worker * num_background);
-        var lms_state_buf: [max_decode_channels]Frame.LmsState = undefined;
-        for (0..num_frames_remaining) |frame_no| {
-            Frame.decode(&reader, &lms_state_buf, &sample_list) catch |e| {
-                std.log.scoped(.qoa_worker).info(
-                    "(id=main) failed to decode frame {}: {s}",
-                    .{ frame_no, @errorName(e) },
-                );
-                return e;
-            };
-        }
     }
 
-    while (num_complete.load(.acquire) < num_background) {
-        std.Thread.sleep(std.time.ns_per_ms / 2);
-    }
     for (worker_threads) |worker| worker.join();
 
     return .{
         .num_channels = header.num_channels,
         .sample_rate_hz = header.sample_rate_hz,
-        .samples = try sample_list.toOwnedSlice(alloc),
+        .sample_list = sample_list,
     };
 }
 
@@ -435,16 +421,25 @@ fn decodeFrames(
     worker_id: usize,
     initial_reader: std.Io.Reader,
     num_frames: usize,
-    incr_on_completion: *std.atomic.Value(u8),
     output_slice: []i16,
 ) DecodeError!void {
-    defer _ = incr_on_completion.fetchAdd(1, .acq_rel);
     var reader = initial_reader;
     var lms_state_buf: [max_decode_channels]Frame.LmsState = undefined;
     var list = std.ArrayList(i16).initBuffer(output_slice);
 
     for (0..num_frames) |frame_no| {
-        Frame.decode(&reader, &lms_state_buf, &list) catch |e| {
+        // Read the frame header
+        const header = try Frame.Header.decode(&reader);
+
+        // Decode the lms states
+        const lms_states = lms_state_buf[0..header.num_channels];
+        for (lms_states) |*lms| lms.* = try .decode(&reader);
+
+        // Get sample output slice
+        const frame_sample_count = header.getSampleSlice();
+        const samples = list.addManyAsSliceAssumeCapacity(frame_sample_count);
+
+        Frame.decodeSlices(&reader, lms_states, header.num_channels, samples) catch |e| {
             std.log.scoped(.qoa_worker).err(
                 "(id={}) failed to decode frame {} with {} frames left: {s}",
                 .{ worker_id, frame_no, num_frames - frame_no, @errorName(e) },
@@ -455,10 +450,10 @@ fn decodeFrames(
 }
 
 pub fn deinit(
-    self: qoa,
+    self: *qoa,
     alloc: std.mem.Allocator,
 ) void {
-    alloc.free(self.samples);
+    self.sample_list.deinit(alloc);
 }
 
 const max = std.math.maxInt(i16);

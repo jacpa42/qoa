@@ -4,10 +4,7 @@ const zaudio = @import("zaudio");
 
 const sample_size = @sizeOf(i16);
 
-pub const std_options = std.Options{
-    // Set the log level to info
-    .log_level = .debug,
-};
+const log = std.log.scoped(.tool);
 
 pub fn main() !void {
     const alloc = std.heap.c_allocator;
@@ -18,29 +15,34 @@ pub fn main() !void {
         return;
     }
 
-    const sound = if (args.multithread) try loadSoundIntoMemoryMultithread(alloc, args.inpath) else try loadSoundIntoMemory(alloc, args.inpath);
-
+    var sound: qoa = undefined;
+    if (args.multithread) {
+        sound = try loadSoundIntoMemoryMultithreadSliced(alloc, args.inpath);
+    } else {
+        sound = try loadSoundIntoMemory(alloc, args.inpath);
+    }
     defer sound.deinit(alloc);
 
-    std.log.info(
+    log.info(
         \\Finished parsing
         \\
         \\ num_channels   : {}
         \\ sample_rate_hz : {}
         \\ num_samples    : {}
         \\ song_duration  : {} minutes
+        \\
     , .{
         sound.num_channels,
         sound.sample_rate_hz,
-        sound.samples.len,
-        sound.samples.len / (sound.sample_rate_hz * std.time.s_per_min),
+        sound.sample_list.items.len,
+        sound.sample_list.items.len / (sound.sample_rate_hz * std.time.s_per_min),
     });
 
     if (args.playback) {
         zaudio.init(alloc);
         defer zaudio.deinit();
-        const as_bytes: [*]u8 = @ptrCast(sound.samples.ptr);
-        var qoa_data_reader = std.Io.Reader.fixed(as_bytes[0 .. sample_size * sound.samples.len]);
+        const as_bytes: [*]u8 = @ptrCast(sound.sample_list.items.ptr);
+        var qoa_data_reader = std.Io.Reader.fixed(as_bytes[0 .. sample_size * sound.sample_list.items.len]);
         // device
         var device_config = zaudio.Device.Config.init(.playback);
         device_config.playback.format = zaudio.Format.signed16;
@@ -75,7 +77,7 @@ fn dataCallback(
     const output_slice = output_array[0 .. frame_count * device.getPlaybackChannels()];
 
     qoa_data_reader.readSliceAll(@ptrCast(output_slice)) catch |err| {
-        std.log.err("Failed to write to output array: {s}", .{@errorName(err)});
+        log.err("Failed to write to output array: {s}", .{@errorName(err)});
     };
 }
 
@@ -176,7 +178,7 @@ fn loadSoundIntoMemory(
     const parse_start = std.time.Instant.now() catch unreachable;
     defer {
         const parse_end = std.time.Instant.now() catch unreachable;
-        std.log.info("Parsed in {:.2}ms", .{
+        log.info("Parsed in {:.2}ms", .{
             @as(f32, @floatFromInt(parse_end.since(parse_start))) / std.time.ns_per_ms,
         });
     }
@@ -186,18 +188,18 @@ fn loadSoundIntoMemory(
     var reader_buf: [1024]u8 = undefined;
     var file_reader = file.reader(&reader_buf);
 
-    std.log.info("parsing file {s}", .{path});
+    log.info("parsing file {s}", .{path});
     return qoa.decodeReader(alloc, &file_reader.interface);
 }
 
-fn loadSoundIntoMemoryMultithread(
+fn loadSoundIntoMemoryMultithreadSliced(
     alloc: std.mem.Allocator,
     path: [:0]const u8,
 ) !qoa {
     const parse_start = std.time.Instant.now() catch unreachable;
     defer {
         const parse_end = std.time.Instant.now() catch unreachable;
-        std.log.info("Parsed in {:.2}ms", .{
+        log.info("Parsed in {:.2}ms", .{
             @as(f32, @floatFromInt(parse_end.since(parse_start))) / std.time.ns_per_ms,
         });
     }
@@ -208,6 +210,6 @@ fn loadSoundIntoMemoryMultithread(
     var file_reader = file.reader(&reader_buf);
     const contents = try file_reader.interface.allocRemaining(alloc, .unlimited);
 
-    std.log.info("parsing file multithreaded {s}", .{path});
-    return qoa.decodeSliceMultithread(alloc, contents);
+    log.info("parsing file multithreaded {s}", .{path});
+    return qoa.decodeSliceMultithread(alloc, contents, null);
 }
