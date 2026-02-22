@@ -2,7 +2,10 @@ const std = @import("std");
 
 const qoa = @This();
 
+const log = std.log.scoped(.qoa);
+
 const magic: [4]u8 = "qoaf".*;
+const default_num_background = 7;
 const max_decode_channels = 8;
 const max_slices_per_frame = 256;
 const num_samples_in_slice = 20;
@@ -89,7 +92,7 @@ pub const Frame = struct {
             @as(u32, header.num_channels);
 
         if ((sample_list.capacity - sample_list.items.len) < total_samples_in_frame) {
-            std.log.err("I need {} bytes, I have {} bytes\n", .{
+            log.err("I need {} bytes, I have {} bytes\n", .{
                 total_samples_in_frame * 2,
                 (sample_list.capacity - sample_list.items.len) * 2,
             });
@@ -304,7 +307,7 @@ pub fn decodeReaderStatic(
         num_samples_in_slice * // -> max samples per frame
         num_channels; // -> max total samples
 
-    std.log.scoped(.qoa).info(
+    log.info(
         "Estimated memory: {:.4}MiB",
         .{@as(f32, @floatFromInt(estimated_total_samples * @sizeOf(i16))) / (1024 * 1024)},
     );
@@ -316,7 +319,7 @@ pub fn decodeReaderStatic(
         try Frame.decode(reader, &lms_states, &sample_list);
     }
 
-    std.log.scoped(.qoa).info(
+    log.info(
         "Filled {:.3}% of arraylist ({:.4}MiB left)",
         .{
             @as(f32, @floatFromInt(100 * sample_list.items.len)) / @as(f32, @floatFromInt(sample_list.capacity)),
@@ -355,7 +358,7 @@ pub fn decodeSliceMultithread(
         samples - 1,
         num_samples_in_slice * max_slices_per_frame,
     );
-    std.debug.print("total frames in file {}\n", .{num_frames});
+    log.info("total frames in file {}\n", .{num_frames});
 
     // This overshoots by a small amount depending on how many are in the final frame.
     // Means we never grow capacity and do at most 1 realloc.
@@ -370,9 +373,14 @@ pub fn decodeSliceMultithread(
         @sizeOf(Frame.LmsState16) * @as(usize, header.num_channels) +
         @sizeOf(Slice) * @as(usize, header.num_channels) * max_slices_per_frame;
 
-    const num_background = 1;
+    const num_background = std.Thread.getCpuCount() catch |e| blk: {
+        log.warn("Unable to query number of cpus: {s}", .{@errorName(e)});
+        log.warn("Using default {}", .{default_num_background + 1});
+        break :blk default_num_background;
+    };
     const num_workers = 1 + num_background;
-    var worker_threads: [num_background]std.Thread = undefined;
+    var worker_threads = try alloc.alloc(std.Thread, num_background);
+    defer alloc.free(worker_threads);
     var num_complete = std.atomic.Value(u8).init(0);
 
     var sample_list = try std.ArrayList(i16).initCapacity(alloc, estimated_total_samples);
@@ -387,15 +395,6 @@ pub fn decodeSliceMultithread(
             header.num_channels; // 1 i16 per channel -> total length of output slice
         const output_slice = try sample_list.addManyAsSliceBounded(samples_per_worker);
 
-        std.debug.print(
-            "Spawning thread id={} with outputslice = {}bytes for {} frames\n",
-            .{ worker_id, output_slice.len * 2, frames_per_worker },
-        );
-        std.debug.print(
-            "Remaining capacity in list: {}bytes\n\n",
-            .{sample_list.unusedCapacitySlice().len * 2},
-        );
-
         worker_threads[worker_id] = try std.Thread.spawn(
             .{ .allocator = alloc, .stack_size = 512 * 1024 },
             decodeFrames,
@@ -408,15 +407,10 @@ pub fn decodeSliceMultithread(
     // We still have a few frames left to decode which we do on the main thread
     {
         const num_frames_remaining = num_frames - (frames_per_worker * num_background);
-        std.debug.print(
-            "number of frames remaining: {}\n",
-            .{num_frames_remaining},
-        );
         var lms_state_buf: [max_decode_channels]Frame.LmsState = undefined;
         for (0..num_frames_remaining) |frame_no| {
-            std.log.scoped(.worker).info("(id=main) frame_number: {}", .{frame_no});
             Frame.decode(&reader, &lms_state_buf, &sample_list) catch |e| {
-                std.log.scoped(.worker).info(
+                std.log.scoped(.qoa_worker).info(
                     "(id=main) failed to decode frame {}: {s}",
                     .{ frame_no, @errorName(e) },
                 );
@@ -424,8 +418,6 @@ pub fn decodeSliceMultithread(
             };
         }
     }
-
-    std.debug.print("Main thread finished and {} workers finished\n", .{num_complete.load(.acquire)});
 
     while (num_complete.load(.acquire) < num_background) {
         std.Thread.sleep(std.time.ns_per_ms / 2);
@@ -452,9 +444,8 @@ fn decodeFrames(
     var list = std.ArrayList(i16).initBuffer(output_slice);
 
     for (0..num_frames) |frame_no| {
-        std.log.scoped(.worker).info("(id={}) frame_number: {}", .{ worker_id, frame_no });
         Frame.decode(&reader, &lms_state_buf, &list) catch |e| {
-            std.log.scoped(.worker).err(
+            std.log.scoped(.qoa_worker).err(
                 "(id={}) failed to decode frame {} with {} frames left: {s}",
                 .{ worker_id, frame_no, num_frames - frame_no, @errorName(e) },
             );
