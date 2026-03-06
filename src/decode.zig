@@ -62,7 +62,7 @@ pub fn fromReaderStatic(
     std.debug.assert(@as(usize, @intFromEnum(samples_per_channel)) >= 1); // same as above :)
 
     // Calculate some info about the file
-    const num_frames_per_channel = samples_per_channel.numFramesPerChannel() orelse unreachable;
+    const num_frames_per_channel = samples_per_channel.totalFramesPerChannel() orelse unreachable;
     const num_channels, const sample_rate_hz = try consts.peekMeta(reader);
 
     // Create lms buf
@@ -152,7 +152,7 @@ pub const multithread = struct {
         const samples_per_channel = file_header.samples_per_channel;
 
         // Calculate some info about the file
-        const num_frames_per_channel = samples_per_channel.numFramesPerChannel() orelse @panic("Cannot decode via multithread if the total number of frames cannot be estimated");
+        const num_frames_per_channel = samples_per_channel.totalFramesPerChannel() orelse @panic("Cannot decode via multithread if the total number of frames cannot be estimated");
         const num_channels, const sample_rate_hz = try consts.peekMeta(&reader);
         const estimated_total_samples = consts.overEstimateTotalSamples(
             num_channels,

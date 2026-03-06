@@ -65,7 +65,6 @@ pub const Header = packed struct(u64) {
     pub const DecodeError = error{
         ReadFailed,
         EndOfStream,
-        ExceededMaxDecodeChannels,
     };
 
     pub fn decode(
@@ -96,17 +95,12 @@ pub const Header = packed struct(u64) {
             std.mem.byteSwapAllFields(Header, &header);
         }
 
-        if (header.num_channels > consts.max_decode_channels) {
-            @branchHint(.cold);
-            return error.ExceededMaxDecodeChannels;
-        }
-
         return header;
     }
 
     /// Gets the size of the buffer required to allocate all the samples for the frame
-    pub fn frameSampleCount(frame_header: Header) usize {
-        return @as(usize, frame_header.samples_per_channel) * @as(usize, frame_header.num_channels);
+    pub fn frameSampleCount(self: Header) usize {
+        return @as(usize, self.samples_per_channel) * @as(usize, self.num_channels);
     }
 };
 
