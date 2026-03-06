@@ -3,25 +3,34 @@ const qoa = @import("qoa");
 const zaudio = @import("zaudio");
 
 const log = std.log.scoped(.tool);
+const iobuf_size = 1024;
 
 pub fn main() !void {
     const gpa = std.heap.c_allocator;
 
-    const args = try parseArgs();
+    var args = try parseArgs(gpa);
+    defer args.deinit(gpa);
+    defer for (args.sound_files.items) |f| f.close();
+
     if (args.help) {
         try printHelp();
         return;
     }
 
-    var file: std.fs.File = std.fs.File.stdin();
-    defer file.close();
-    var iobuf: [1024]u8 = undefined;
-    var file_reader: std.fs.File.Reader = undefined;
+    if (args.sound_files.items.len == 0) return error.NoSoundFiles;
 
-    var num_channels: u8 = undefined;
-    var sample_rate_hz: u24 = undefined;
+    var sample_buffers = std.ArrayList(i16).initBuffer(try gpa.alloc(i16, qoa.consts.max_samples_per_frame * args.sound_files.items.len));
+    defer sample_buffers.deinit(gpa);
+    var io_buffers = try gpa.alloc(u8, args.sound_files.items.len * iobuf_size);
+    defer gpa.free(io_buffers);
+    var file_readers = try gpa.alloc(std.fs.File.Reader, args.sound_files.items.len);
+    defer gpa.free(file_readers);
 
-    var sample_iter = blk: {
+    // TODO: Implement mixing for different number of channels
+    var num_channels_opt: ?u8 = null;
+    var sample_rate_hz_opt: ?u24 = null;
+
+    var sample_iters = blk: {
         const parse_start = std.time.Instant.now() catch unreachable;
         defer {
             const parse_end = std.time.Instant.now() catch unreachable;
@@ -30,39 +39,54 @@ pub fn main() !void {
             });
         }
 
-        file = try std.fs.cwd().openFile(args.inpath, .{});
-        file_reader = file.reader(&iobuf);
+        const sample_iters = try gpa.alloc(qoa.SampleIter, args.sound_files.items.len);
+        for (0.., args.sound_files.items, sample_iters) |i, file, *sample_iter| {
+            const iobuf = io_buffers[i * iobuf_size .. (i + 1) * iobuf_size];
+            file_readers[i] = file.reader(iobuf);
 
-        const frame_header, const frame_iter = try qoa.FrameIter.init(&file_reader.interface);
-        num_channels = frame_header.num_channels;
-        sample_rate_hz = frame_header.sample_rate_hz;
+            const frame_header, const frame_iter = try qoa.FrameIter.init(&file_readers[i].interface);
 
-        // NOTE: as we are *not* in streaming mode, we can use the number of samples in the first frame as the upper bound for samples in the whole file.
-        const buf = try gpa.alloc(i16, frame_header.frameSampleCount());
-        break :blk qoa.SampleIter.initFrameIter(frame_iter, buf);
+            if (num_channels_opt) |c| {
+                if (frame_header.num_channels != c) return error.NotAllFilesHaveSameNumberOfChannels;
+            } else num_channels_opt = frame_header.num_channels;
+
+            if (sample_rate_hz_opt) |s| {
+                if (frame_header.sample_rate_hz != s) return error.NotAllFilesHaveSameSampleRate;
+            } else sample_rate_hz_opt = frame_header.sample_rate_hz;
+
+            // NOTE: as we are *not* in streaming mode, we can use the number of samples in the first frame as the upper bound for samples in the whole file.
+            const buf = try sample_buffers.addManyAsSliceBounded(frame_header.frameSampleCount());
+            sample_iter.* = qoa.SampleIter.initFrameIter(frame_iter, buf);
+        }
+        break :blk sample_iters;
     };
-    defer sample_iter.deinit(gpa);
+    defer gpa.free(sample_iters);
 
-    log.info(
-        \\
-        \\┌────────────────────────────────┐
-        \\│ mode           :          file │
-        \\│ num_channels   : {:13} │
-        \\│ sample_rate_hz : {:13} │
-        \\│ num_samples<   : {:13} │
-        \\│ playback speed : {:13.2} │
-        \\│ ~song_duration : {:5} minutes │
-        \\└────────────────────────────────┘
-        \\
-    , .{
-        num_channels,
-        sample_rate_hz,
-        sample_iter.frame_iter.overestimateSamplesRemaining(num_channels),
-        args.speed,
-        sample_iter.frame_iter.overestimateSamplesRemaining(num_channels) / (sample_rate_hz * std.time.s_per_min),
-    });
+    const num_channels = num_channels_opt.?;
+    const sample_rate_hz = sample_rate_hz_opt.?;
 
-    if (args.playback) {
+    if (args.show_file_info) for (sample_iters) |sample_iter| {
+        log.info(
+            \\
+            \\┌────────────────────────────────┐
+            \\│ mode           :          file │
+            \\│ num_channels   : {:13} │
+            \\│ sample_rate_hz : {:13} │
+            \\│ num_samples<   : {:13} │
+            \\│ playback speed : {:13.2} │
+            \\│ ~song_duration : {:5} minutes │
+            \\└────────────────────────────────┘
+            \\
+        , .{
+            num_channels,
+            sample_rate_hz,
+            sample_iter.frame_iter.overestimateSamplesRemaining(num_channels),
+            args.speed,
+            sample_iter.frame_iter.overestimateSamplesRemaining(num_channels) / (sample_rate_hz * std.time.s_per_min),
+        });
+    };
+
+    {
         defer zaudio.deinit();
         zaudio.init(gpa);
 
@@ -73,7 +97,7 @@ pub fn main() !void {
         const val = args.speed * @as(f32, @floatFromInt(sample_rate_hz));
         device_config.sample_rate = if (val > std.math.maxInt(u24)) std.math.maxInt(u24) else @intFromFloat(val);
         device_config.data_callback = dataCallback;
-        device_config.user_data = @ptrCast(&sample_iter);
+        device_config.user_data = @ptrCast(&sample_iters);
 
         const device = zaudio.Device.create(null, device_config) catch {
             @panic("Failed to open playback device");
@@ -101,35 +125,41 @@ fn dataCallback(
     _: ?*const anyopaque,
     frame_count: u32,
 ) callconv(.c) void {
-    const sound_reader: *qoa.SampleIter = @ptrCast(@alignCast(device.getUserData().?));
+    const sounds: *[]qoa.SampleIter = @ptrCast(@alignCast(device.getUserData().?));
     var output_array: [*]i16 = @ptrCast(@alignCast(pOutput orelse return));
 
-    sound_reader.nextSlice(output_array[0 .. frame_count * device.getPlaybackChannels()]) catch |e| {
+    sounds.*[0].nextSlice(output_array[0 .. frame_count * device.getPlaybackChannels()]) catch |e| {
         log.err("Failed to write samples to output: {}", .{e});
     };
+
+    // TODO: Make mixing make sense :)
+    for (sounds.*[1..]) |*sound| {
+        for (0..frame_count * device.getPlaybackChannels()) |idx| {
+            if (sound.next() catch null) |v| output_array[idx] +|= v;
+        }
+    }
 }
 
 fn trim(buf: []const u8) []const u8 {
     return std.mem.trim(u8, buf, &std.ascii.whitespace);
 }
 
-fn eql(l: []const u8, r: []const u8) bool {
-    return std.mem.eql(u8, l, r);
+fn startsWith(l: []const u8, r: []const u8) bool {
+    return std.mem.startsWith(u8, l, r);
 }
 
 fn printHelp() !void {
-    const stdout = std.fs.File.stderr();
-    var writer = stdout.writer(&.{});
+    var writer = std.fs.File.stderr().writer(&.{});
     try writer.interface.writeAll(
         \\Epic qoa tool. Takes in an input file and plays it back
         \\
         \\SYNOPSIS
         \\      tool [options] input-file
         \\OPTIONS
-        \\      --help,        -h  Print this menu and exit
-        \\      --stream,      -s  Decode a single frame at a time instead of the whole file at once.
-        \\      --speed,       -S  Modify the speed at which playback occurs. Accepts a floating point value.
-        \\      --playback,    -p  Play the audio file using zaudio
+        \\      --help,           -h  Print this menu and exit.
+        \\      --show-file-info, -S  Show file info.
+        \\      --speed,          -s  Modify the speed at which playback occurs. Accepts a floating point value.
+        \\      --path,           -p  Specify a qoa file to play. Multiple files can be specified to play multiple files at once.
         \\
     );
     try writer.interface.flush();
@@ -137,38 +167,35 @@ fn printHelp() !void {
 
 const Args = struct {
     help: bool,
-    playback: bool,
-    stream: bool,
+    show_file_info: bool,
     speed: f32,
-    inpath: [:0]const u8,
+    sound_files: std.ArrayList(std.fs.File),
+
+    pub fn deinit(self: *Args, gpa: std.mem.Allocator) void {
+        for (self.sound_files.items) |f| f.close();
+        self.sound_files.deinit(gpa);
+    }
 };
 
-const Error = error{
-    ExpectedThreadCountValue,
-    ExpectedSpeedValue,
-} || std.fmt.ParseIntError;
-
-fn parseArgs() Error!Args {
+fn parseArgs(gpa: std.mem.Allocator) !Args {
     var args = std.process.args();
     _ = args.next();
 
     var no_arg_provided = true;
+    var show_file_info = false;
     var help = false;
-    var playback = false;
     var speed: f32 = 1;
-    var stream = false;
-    var inpath: [:0]const u8 = &.{};
+    var inpaths: std.ArrayList(std.fs.File) = .empty;
+    errdefer for (inpaths.items) |f| f.close();
 
     while (args.next()) |arg| {
         no_arg_provided = false;
         var trimmed = trim(arg);
-        if (eql(trimmed, "-h") or eql(trimmed, "--help")) {
+        if (startsWith(trimmed, "-h") or startsWith(trimmed, "--help")) {
             help = true;
-        } else if (eql(trimmed, "-p") or eql(trimmed, "--playback")) {
-            playback = true;
-        } else if (eql(trimmed, "-s") or eql(trimmed, "--stream")) {
-            stream = true;
-        } else if (eql(trimmed, "-S") or eql(trimmed, "--speed")) {
+        } else if (startsWith(trimmed, "-S") or startsWith(trimmed, "--show-file-info")) {
+            show_file_info = true;
+        } else if (startsWith(trimmed, "-s") or startsWith(trimmed, "--speed")) {
             if (std.mem.indexOfScalar(u8, trimmed, '=')) |equal_char| {
                 speed = std.fmt.parseFloat(@TypeOf(speed), trimmed[equal_char + 1 ..]) catch |e| {
                     log.err("Failed to parse \"{s}\" into speed {s}", .{ trimmed[equal_char + 1 ..], @errorName(e) });
@@ -187,16 +214,30 @@ fn parseArgs() Error!Args {
                     return e;
                 };
             }
+        } else if (startsWith(trimmed, "-p") or startsWith(trimmed, "--path")) {
+            if (std.mem.indexOfScalar(u8, trimmed, '=')) |equal_char| {
+                try inpaths.append(gpa, try std.fs.cwd().openFile(trimmed[equal_char + 1 ..], .{}));
+            } else { // must be next arg
+                const next = args.next() orelse {
+                    const e = error.ExpectedQoaFilePath;
+                    log.err("Failed to parse speed {s}", .{@errorName(e)});
+                    return e;
+                };
+                trimmed = trim(next);
+
+                try inpaths.append(gpa, try std.fs.cwd().openFile(trimmed, .{}));
+            }
         } else {
-            inpath = arg;
+            log.warn("Unknown argument: \"{s}\"", .{trimmed});
+            help = true;
+            break;
         }
     }
 
     return Args{
-        .help = help or no_arg_provided or inpath.len == 0,
-        .playback = playback,
+        .help = help or no_arg_provided,
+        .show_file_info = show_file_info,
         .speed = speed,
-        .stream = stream,
-        .inpath = inpath,
+        .sound_files = inpaths,
     };
 }

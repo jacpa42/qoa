@@ -1,9 +1,9 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-const consts = @import("src/constants.zig");
-const Frame = @import("src/Frame.zig");
-const Header = @import("src/Header.zig");
+pub const consts = @import("src/constants.zig");
+pub const Frame = @import("src/Frame.zig");
+pub const Header = @import("src/Header.zig");
 
 test {
     std.testing.refAllDecls(@This());
