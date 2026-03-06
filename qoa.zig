@@ -1,7 +1,7 @@
 const std = @import("std");
 const consts = @import("src/constants.zig");
-const log = std.log.scoped(.qoa);
 
+pub const streaming = @import("src/streaming.zig");
 pub const Frame = @import("src/Frame.zig");
 pub const Header = @import("src/Header.zig");
 pub const decode = @import("src/decode.zig");
@@ -16,9 +16,6 @@ num_channels: u8,
 sample_rate_hz: u24,
 sample_list: std.ArrayList(i16),
 
-pub fn deinit(
-    self: *qoa,
-    alloc: std.mem.Allocator,
-) void {
+pub fn deinit(self: *qoa, alloc: std.mem.Allocator) void {
     self.sample_list.deinit(alloc);
 }

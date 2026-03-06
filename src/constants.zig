@@ -5,7 +5,6 @@ pub const stack_size = 64 * 1024;
 pub const default_num_workers = 8;
 pub const max_workers = 256;
 pub const native_endian = @import("builtin").cpu.arch.endian();
-pub const magic: [4]u8 = "qoaf".*;
 pub const max_decode_channels = 8;
 pub const max_slices_per_frame = 256;
 pub const num_samples_in_slice = 20;

@@ -49,6 +49,7 @@ pub fn decodeSlices(
 
 pub const Slice = packed struct {
     data: u64,
+
     pub const DecodeError = error{ ReadFailed, EndOfStream };
     pub fn decode(reader: *std.Io.Reader) Slice.DecodeError!Slice {
         return @bitCast(try reader.takeInt(u64, .big));
@@ -104,7 +105,7 @@ pub const Header = packed struct(u64) {
     }
 
     /// Gets the size of the buffer required to allocate all the samples for the frame
-    pub fn getSampleSlice(frame_header: Header) usize {
+    pub fn frameSampleCount(frame_header: Header) usize {
         return @as(usize, frame_header.samples_per_channel) * @as(usize, frame_header.num_channels);
     }
 };

@@ -2,12 +2,22 @@ const std = @import("std");
 const consts = @import("constants.zig");
 const Header = @This();
 
+pub const magic = "qoaf";
+
+samples_per_channel: SamplesPerChannel,
+
+pub const DecodeError = error{
+    InvalidFileFormat,
+    ReadFailed,
+    EndOfStream,
+};
+
 /// Checks the magic and returns the SamplesPerChannel for this file
 pub fn decode(
     reader: *std.Io.Reader,
-) DecodeError!SamplesPerChannel {
+) DecodeError!Header {
     try checkMagic(reader);
-    return SamplesPerChannel.decode(reader);
+    return .{ .samples_per_channel = try .decode(reader) };
 }
 
 pub const SamplesPerChannel = enum(u32) {
@@ -17,13 +27,7 @@ pub const SamplesPerChannel = enum(u32) {
     pub fn decode(
         reader: *std.Io.Reader,
     ) DecodeError!SamplesPerChannel {
-        var samples_per_channel: u32 = @bitCast((try reader.takeArray(@sizeOf(SamplesPerChannel))).*);
-
-        if (consts.native_endian != .big) {
-            samples_per_channel = @byteSwap(samples_per_channel);
-        }
-
-        return @enumFromInt(samples_per_channel);
+        return @enumFromInt(try reader.takeInt(u32, .big));
     }
 
     /// Returns the number of frames per channel in the whole file rounded up.
@@ -32,25 +36,18 @@ pub const SamplesPerChannel = enum(u32) {
     pub fn numFramesPerChannel(self: SamplesPerChannel) ?u32 {
         return switch (self) {
             .streaming => null,
-            else => 1 + @divFloor(@as(u32, @intFromEnum(self)) - 1, max_samples_per_frame),
+            else => 1 + @divFloor(
+                @as(u32, @intFromEnum(self)) - 1,
+                max_samples_per_frame,
+            ),
         };
     }
-};
-
-pub const DecodeError = error{
-    InvalidFileFormat,
-    ReadFailed,
-    EndOfStream,
 };
 
 pub fn checkMagic(
     reader: *std.Io.Reader,
 ) DecodeError!void {
-    const magic: [4]u8 = (try reader.takeArray(4)).*;
-
-    if (@as(u32, @bitCast(magic)) !=
-        @as(u32, @bitCast(consts.magic)))
-    {
+    if (!std.mem.eql(u8, try reader.takeArray(4), magic)) {
         return error.InvalidFileFormat;
     }
 }

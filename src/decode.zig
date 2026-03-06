@@ -11,40 +11,44 @@ test {
 }
 
 pub const Error = error{
-    EndOfStream,
     ExceededMaxDecodeChannels,
     InvalidFileFormat,
     OutOfMemory,
-    ReadFailed,
-};
+
+    /// When the decoder expected a file and finds a streamer then it can't decode as if it where decoding a file.
+    ExpectedFileFoundStream,
+} || std.Io.Reader.Error;
 
 /// Decodes directly from the file reader allocating once only for the sample data
 pub fn fromPath(
-    alloc: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     sub_path: [:0]const u8,
 ) (Error || std.fs.File.OpenError)!qoa {
-    var file = try std.fs.cwd().openFile(sub_path, .{});
+    var f = try std.fs.cwd().openFile(sub_path, .{});
+    defer f.close();
+
     var iobuf: [1024]u8 = undefined;
-    var reader = file.reader(&iobuf);
-    return fromReader(alloc, &reader.interface);
+    var reader = f.reader(&iobuf);
+
+    return fromReader(&reader.interface, gpa);
 }
 
 pub fn fromSlice(
-    alloc: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     slice: []const u8,
 ) Error!qoa {
     var reader = std.Io.Reader.fixed(slice);
-    return fromReader(alloc, &reader);
+    return fromReader(&reader, gpa);
 }
 
 pub fn fromReader(
-    alloc: std.mem.Allocator,
     reader: *std.Io.Reader,
+    gpa: std.mem.Allocator,
 ) Error!qoa {
-    const samples_per_channel = try Header.decode(reader);
-    return switch (samples_per_channel) {
-        .streaming => @panic("TODO: Implement streaming decoder"),
-        else => |samples| fromReaderStatic(alloc, reader, samples),
+    const header = try Header.decode(reader);
+    return switch (header.samples_per_channel) {
+        .streaming => error.ExpectedFileFoundStream,
+        else => |samples| fromReaderStatic(gpa, reader, samples),
     };
 }
 
@@ -60,22 +64,22 @@ pub fn fromReaderStatic(
     // Calculate some info about the file
     const num_frames_per_channel = samples_per_channel.numFramesPerChannel() orelse unreachable;
     const num_channels, const sample_rate_hz = try consts.peekMeta(reader);
-    const estimated_total_samples = consts.overEstimateTotalSamples(
-        num_channels,
-        num_frames_per_channel,
-    );
 
     // Create lms buf
     if (num_channels > consts.max_decode_channels) return error.ExceededMaxDecodeChannels;
     var lms_state_buf: [consts.max_decode_channels]Frame.LmsState = undefined;
 
+    const estimated_total_samples = consts.overEstimateTotalSamples(
+        num_channels,
+        num_frames_per_channel,
+    );
+    var sample_list = try std.ArrayList(i16).initCapacity(alloc, estimated_total_samples);
+    errdefer sample_list.deinit(alloc);
+
     log.debug(
         "Estimated memory: {:.4}MiB",
         .{@as(f32, @floatFromInt(estimated_total_samples * @sizeOf(i16))) / (1024 * 1024)},
     );
-
-    var sample_list = try std.ArrayList(i16).initCapacity(alloc, estimated_total_samples);
-    errdefer sample_list.deinit(alloc);
 
     for (0..num_frames_per_channel) |_| {
         // read the frame header
@@ -86,8 +90,7 @@ pub fn fromReaderStatic(
         for (lms_states) |*lms| lms.* = try .decode(reader);
 
         // Get sample output slice
-        const frame_sample_count = header.getSampleSlice();
-        const samples = try sample_list.addManyAsSliceBounded(frame_sample_count);
+        const samples = try sample_list.addManyAsSliceBounded(header.frameSampleCount());
 
         try Frame.decodeSlices(reader, lms_states, header.num_channels, samples);
     }
@@ -116,15 +119,19 @@ pub const multithread = struct {
         std.Io.Reader.LimitedAllocError ||
         std.Thread.SpawnError;
 
-    /// Loads the whole file into memory and then decodes it via using a couple workers
+    /// Loads the whole file into memory and then decodes it via using a couple workers.
+    ///
+    /// Allocates for loading the encoded data and once for the sample data.
     pub fn fromPath(
         alloc: std.mem.Allocator,
         sub_path: [:0]const u8,
         worker_thread_count: ?usize,
     ) FilePathError!qoa {
-        var file = try std.fs.cwd().openFile(sub_path, .{});
+        var f = try std.fs.cwd().openFile(sub_path, .{});
+        defer f.close();
+
         var iobuf: [1024]u8 = undefined;
-        var reader = file.reader(&iobuf);
+        var reader = f.reader(&iobuf);
 
         var list = std.ArrayList(u8).empty;
         defer list.deinit(alloc);
@@ -141,7 +148,8 @@ pub const multithread = struct {
     ) (Error || std.Thread.SpawnError)!qoa {
         var reader = std.Io.Reader.fixed(data);
 
-        const samples_per_channel = try qoa.Header.decode(&reader);
+        const file_header = try qoa.Header.decode(&reader);
+        const samples_per_channel = file_header.samples_per_channel;
 
         // Calculate some info about the file
         const num_frames_per_channel = samples_per_channel.numFramesPerChannel() orelse @panic("Cannot decode via multithread if the total number of frames cannot be estimated");
@@ -240,7 +248,7 @@ pub const multithread = struct {
             for (lms_states) |*lms| lms.* = try .decode(&reader);
 
             // Get sample output slice
-            const frame_sample_count = header.getSampleSlice();
+            const frame_sample_count = header.frameSampleCount();
             const samples = list.addManyAsSliceAssumeCapacity(frame_sample_count);
 
             qoa.Frame.decodeSlices(&reader, lms_states, header.num_channels, samples) catch |e| {

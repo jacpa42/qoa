@@ -6,8 +6,25 @@ const sample_size = @sizeOf(i16);
 
 const log = std.log.scoped(.tool);
 
+const Sound = union(enum) {
+    file: qoa,
+    fixed_stream: qoa.streaming.Fixed,
+};
+
+const SoundReader = union(enum) {
+    file: struct {
+        samples: []i16,
+        position: usize,
+    },
+    fixed_stream: struct {
+        stream: *qoa.streaming.Fixed,
+        frame: []i16,
+        frame_pos: usize,
+    },
+};
+
 pub fn main() !void {
-    const alloc = std.heap.c_allocator;
+    const gpa = std.heap.c_allocator;
 
     const args = try parseArgs();
     if (args.help) {
@@ -15,50 +32,104 @@ pub fn main() !void {
         return;
     }
 
-    var sound: qoa = undefined;
-    var thread_count: ?usize = null;
-    if (args.multithread or args.thread_count != null) {
-        if (args.thread_count) |t| {
-            if (t > 0) thread_count = t;
-        }
-        sound = try loadSoundMultiThreaded(alloc, args.inpath, thread_count);
-    } else {
-        sound = try loadSound(alloc, args.inpath);
-    }
-    defer sound.deinit(alloc);
+    var sound: Sound = blk: {
+        if (args.stream and !args.multithread) {
+            const fixed_stream = try loadAudioStream(gpa, args.inpath);
+            // NOTE: I don't deinit any memory because it doesn't really matter here
 
-    log.info(
-        \\Finished parsing
-        \\┌────────────────────────────────┐
-        \\│ num_threads    : {any:13} │
-        \\│ num_channels   : {:13} │
-        \\│ sample_rate_hz : {:13} │
-        \\│ num_samples    : {:13} │
-        \\│ buffer size    : {:9} MiB │
-        \\│ song_duration  : {:5} minutes │
-        \\└────────────────────────────────┘
-        \\
-    , .{
-        thread_count,
-        sound.num_channels,
-        sound.sample_rate_hz,
-        sound.sample_list.items.len,
-        sound.sample_list.capacity * @sizeOf(i16) / (1024 * 1024),
-        sound.sample_list.items.len / (sound.sample_rate_hz * std.time.s_per_min),
-    });
+            log.info(
+                \\
+                \\┌────────────────────────────────┐
+                \\│ mode           :     streaming │
+                \\│ num_threads    :          null │
+                \\│ num_channels   : {:13} │
+                \\│ sample_rate_hz : {:13} │
+                \\│ num_samples    :          n.a. │
+                \\│ buffer size    : {:9} MiB │
+                \\│ song_duration  :          n.a. │
+                \\└────────────────────────────────┘
+                \\
+            , .{
+                fixed_stream.num_channels,
+                fixed_stream.sample_rate_hz,
+                fixed_stream.frame_samples.len * sample_size / (1024 * 1024),
+            });
+
+            break :blk .{ .fixed_stream = fixed_stream };
+        } else {
+            var sound_file: qoa = undefined;
+            var thread_count: ?usize = std.Thread.getCpuCount() catch null;
+            if (args.multithread or args.thread_count != null) {
+                if (args.thread_count) |t| {
+                    if (t > 0) thread_count = t;
+                }
+                sound_file = try loadSoundMultiThreaded(gpa, args.inpath, thread_count);
+            } else {
+                sound_file = try loadSound(gpa, args.inpath);
+            }
+
+            log.info(
+                \\
+                \\┌────────────────────────────────┐
+                \\│ mode           :          file │
+                \\│ num_threads    : {any:13} │
+                \\│ num_channels   : {:13} │
+                \\│ sample_rate_hz : {:13} │
+                \\│ num_samples    : {:13} │
+                \\│ buffer size    : {:9} MiB │
+                \\│ song_duration  : {:5} minutes │
+                \\└────────────────────────────────┘
+                \\
+            , .{
+                thread_count,
+                sound_file.num_channels,
+                sound_file.sample_rate_hz,
+                sound_file.sample_list.items.len,
+                sound_file.sample_list.capacity * sample_size / (1024 * 1024),
+                sound_file.sample_list.items.len / (sound_file.sample_rate_hz * std.time.s_per_min),
+            });
+            break :blk .{ .file = sound_file };
+        }
+    };
 
     if (args.playback) {
-        zaudio.init(alloc);
+        var channels: u8 = undefined;
+        var sample_rate: u24 = undefined;
+        var sound_reader: SoundReader = switch (sound) {
+            .file => |file| blk: {
+                channels = file.num_channels;
+                sample_rate = file.sample_rate_hz;
+                break :blk SoundReader{
+                    .file = .{
+                        .samples = file.sample_list.items,
+                        .position = 0,
+                    },
+                };
+            },
+            .fixed_stream => |*fixed_stream| blk: {
+                channels = fixed_stream.num_channels;
+                sample_rate = fixed_stream.sample_rate_hz;
+                const current_frame = try fixed_stream.next();
+                break :blk SoundReader{
+                    .fixed_stream = .{
+                        .stream = fixed_stream,
+                        .frame = current_frame.?,
+                        .frame_pos = 0,
+                    },
+                };
+            },
+        };
+
         defer zaudio.deinit();
-        const as_bytes: [*]u8 = @ptrCast(sound.sample_list.items.ptr);
-        var qoa_data_reader = std.Io.Reader.fixed(as_bytes[0 .. sample_size * sound.sample_list.items.len]);
+        zaudio.init(gpa);
+
         // device
         var device_config = zaudio.Device.Config.init(.playback);
         device_config.playback.format = zaudio.Format.signed16;
-        device_config.playback.channels = sound.num_channels;
-        device_config.sample_rate = sound.sample_rate_hz;
+        device_config.playback.channels = channels;
+        device_config.sample_rate = sample_rate;
         device_config.data_callback = dataCallback;
-        device_config.user_data = @ptrCast(&qoa_data_reader);
+        device_config.user_data = @ptrCast(&sound_reader);
 
         const device = zaudio.Device.create(null, device_config) catch {
             @panic("Failed to open playback device");
@@ -70,7 +141,7 @@ pub fn main() !void {
         };
 
         while (device.getState() != .stopped or device.getState() != .stopping) {
-            std.Thread.sleep(1 * std.time.ns_per_s);
+            std.Thread.sleep(20 * std.time.ns_per_ms);
         }
     }
 }
@@ -81,37 +152,50 @@ fn dataCallback(
     _: ?*const anyopaque,
     frame_count: u32,
 ) callconv(.c) void {
-    const qoa_data_reader: *std.Io.Reader = @ptrCast(@alignCast(device.getUserData().?));
-    const output_array: [*]i16 = @ptrCast(@alignCast(pOutput orelse return));
-    const output_slice = output_array[0 .. frame_count * device.getPlaybackChannels()];
+    const sound_reader: *SoundReader = @ptrCast(@alignCast(device.getUserData().?));
+    var output_array: [*]i16 = @ptrCast(@alignCast(pOutput orelse return));
 
-    qoa_data_reader.readSliceAll(@ptrCast(output_slice)) catch |err| {
-        log.err("Failed to write to output array: {s}", .{@errorName(err)});
-    };
+    switch (sound_reader.*) {
+        .file => |*sample_reader| {
+            const start = sample_reader.position;
+            sample_reader.position += frame_count * device.getPlaybackChannels();
+            const end = sample_reader.position;
+
+            @memcpy(output_array, sample_reader.samples[start..end]);
+        },
+        .fixed_stream => |*stream| {
+            var samples_remaining = frame_count * device.getPlaybackChannels();
+
+            while (samples_remaining > 0) {
+                var samples_left = stream.frame.len -| stream.frame_pos;
+
+                if (samples_left == 0) {
+                    log.debug("Reading next frame", .{});
+                    const next = stream.stream.next() catch |err| {
+                        log.err("Failed to decode next stream: {s}", .{@errorName(err)});
+                        return;
+                    } orelse {
+                        log.info("End of stream reached", .{});
+                        return;
+                    };
+
+                    stream.frame = next;
+                    stream.frame_pos = 0;
+                    samples_left = next.len;
+                }
+
+                std.debug.assert(samples_left > 0);
+
+                const samples_we_consume = @min(samples_left, samples_remaining);
+                samples_remaining -= samples_we_consume;
+                @memcpy(output_array, stream.frame[stream.frame_pos .. stream.frame_pos + samples_we_consume]);
+
+                stream.frame_pos += samples_we_consume;
+                output_array = output_array + samples_we_consume;
+            }
+        },
+    }
 }
-
-fn trim(buf: []const u8) []const u8 {
-    return std.mem.trim(u8, buf, &std.ascii.whitespace);
-}
-
-fn printHelp() !void {
-    const stdout = std.fs.File.stderr();
-    var writer = stdout.writer(&.{});
-    try writer.interface.writeAll(
-        \\Epic qoa tool. Takes in an input file and plays it back
-        \\
-        \\SYNOPSIS
-        \\      tool [options] input-file
-        \\OPTIONS
-        \\      --help,        -h  Print this menu and exit
-        \\      --multithread, -m  Use the multithreaded decoder
-        \\      --threads,     -t  The number of worker threads to use with the --multithread option
-        \\      --playback,    -p  Play the audio file using zaudio
-        \\
-    );
-    try writer.interface.flush();
-}
-
 pub fn onMalloc(len: usize, user_data: ?*anyopaque) callconv(.c) ?*anyopaque {
     const allocator: *std.mem.Allocator = @ptrCast(user_data.?);
     const slice = allocator.alloc(u8, len) catch return null;
@@ -136,9 +220,33 @@ pub fn onFree(ptr: ?*anyopaque, user_data: ?*anyopaque) callconv(.c) void {
     }
 }
 
+fn trim(buf: []const u8) []const u8 {
+    return std.mem.trim(u8, buf, &std.ascii.whitespace);
+}
+
+fn printHelp() !void {
+    const stdout = std.fs.File.stderr();
+    var writer = stdout.writer(&.{});
+    try writer.interface.writeAll(
+        \\Epic qoa tool. Takes in an input file and plays it back
+        \\
+        \\SYNOPSIS
+        \\      tool [options] input-file
+        \\OPTIONS
+        \\      --help,        -h  Print this menu and exit
+        \\      --multithread, -m  Use the multithreaded decoder
+        \\      --stream,      -s  Decode a single frame at a time instead of the whole file at once.
+        \\      --threads,     -t  The number of worker threads to use with the --multithread option
+        \\      --playback,    -p  Play the audio file using zaudio
+        \\
+    );
+    try writer.interface.flush();
+}
+
 const Args = struct {
     help: bool,
     playback: bool,
+    stream: bool,
     thread_count: ?u8,
     multithread: bool,
     inpath: [:0]const u8,
@@ -157,6 +265,7 @@ fn parseArgs() Error!Args {
     var thread_count: ?u8 = null;
     var multithread = false;
     var playback = false;
+    var stream = false;
     var inpath: [:0]const u8 = &.{};
 
     while (args.next()) |arg| {
@@ -170,6 +279,10 @@ fn parseArgs() Error!Args {
             std.mem.startsWith(u8, trimmed, "--p"))
         {
             playback = true;
+        } else if (std.mem.startsWith(u8, trimmed, "-s") or
+            std.mem.startsWith(u8, trimmed, "--s"))
+        {
+            stream = true;
         } else if (std.mem.startsWith(u8, trimmed, "-m") or
             std.mem.startsWith(u8, trimmed, "--m"))
         {
@@ -205,6 +318,7 @@ fn parseArgs() Error!Args {
         .multithread = multithread,
         .thread_count = thread_count,
         .playback = playback,
+        .stream = stream,
         .inpath = inpath,
     };
 }
@@ -240,4 +354,31 @@ fn loadSoundMultiThreaded(
 
     log.info("parsing file {s}", .{path});
     return qoa.decode.multithread.fromPath(alloc, path, threads);
+}
+
+fn loadAudioStream(
+    gpa: std.mem.Allocator,
+    path: [:0]const u8,
+) !qoa.streaming.Fixed {
+    const parse_start = std.time.Instant.now() catch unreachable;
+    defer {
+        const parse_end = std.time.Instant.now() catch unreachable;
+        log.info("Parsed in {:.2}ms", .{
+            @as(f32, @floatFromInt(parse_end.since(parse_start))) / std.time.ns_per_ms,
+        });
+    }
+
+    log.info("parsing file {s}", .{path});
+
+    var f = try std.fs.cwd().openFile(path, .{});
+    defer f.close();
+
+    var iobuf: [1024]u8 = undefined;
+    var reader = f.reader(&iobuf);
+
+    var list = std.ArrayList(u8).empty;
+    // defer list.deinit(gpa); // NOTE: Don't deinit!
+    try reader.interface.appendRemaining(gpa, &list, .unlimited);
+
+    return try qoa.streaming.Fixed.init(gpa, list.items);
 }
