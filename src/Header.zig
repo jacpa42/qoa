@@ -33,7 +33,7 @@ pub const SamplesPerChannel = enum(u32) {
     /// Returns the number of frames per channel in the whole file rounded up.
     /// Not known if streaming.
     const max_samples_per_frame = consts.num_samples_in_slice * consts.max_slices_per_frame;
-    pub fn numFramesPerChannel(self: SamplesPerChannel) ?u32 {
+    pub fn totalFramesPerChannel(self: SamplesPerChannel) ?u32 {
         return switch (self) {
             .streaming => null,
             else => 1 + @divFloor(
