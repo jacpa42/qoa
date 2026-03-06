@@ -2,8 +2,8 @@ const std = @import("std");
 const qoa = @This();
 
 pub const stack_size = 64 * 1024;
-pub const default_num_workers = 8;
-pub const max_workers = 256;
+pub const fallback_num_workers = 8;
+pub const max_workers = 64;
 pub const native_endian = @import("builtin").cpu.arch.endian();
 pub const max_decode_channels = 8;
 pub const max_slices_per_frame = 256;
@@ -36,7 +36,7 @@ pub fn clamp(v: i32) i16 {
 }
 
 comptime {
-    if (default_num_workers <= 0) {
+    if (fallback_num_workers <= 0) {
         @compileError("default_num_workers must be > 0");
     }
 }

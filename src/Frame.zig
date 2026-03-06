@@ -77,11 +77,6 @@ pub const Header = packed struct(u64) {
             std.mem.byteSwapAllFields(Header, &header);
         }
 
-        if (header.num_channels > consts.max_decode_channels) {
-            @branchHint(.cold);
-            return error.ExceededMaxDecodeChannels;
-        }
-
         return header;
     }
 

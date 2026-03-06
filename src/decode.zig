@@ -162,8 +162,8 @@ pub const multithread = struct {
         const num_workers: usize = blk: {
             const num_workers = worker_thread_count orelse std.Thread.getCpuCount() catch |e| {
                 log.warn("Unable to query number of cpus: {s}", .{@errorName(e)});
-                log.warn("Using default {}", .{consts.default_num_workers});
-                break :blk consts.default_num_workers;
+                log.warn("Using default {}", .{consts.fallback_num_workers});
+                break :blk consts.fallback_num_workers;
             };
             break :blk @max(num_workers, 1);
         };
