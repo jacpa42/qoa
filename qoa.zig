@@ -1,11 +1,9 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-pub const consts = @import("src/constants.zig");
-pub const streaming = @import("src/streaming.zig");
-pub const Frame = @import("src/Frame.zig");
-pub const Header = @import("src/Header.zig");
-pub const decode = @import("src/decode.zig");
+const consts = @import("src/constants.zig");
+const Frame = @import("src/Frame.zig");
+const Header = @import("src/Header.zig");
 
 test {
     std.testing.refAllDecls(@This());
@@ -82,11 +80,10 @@ pub const FrameIter = struct {
         for (lms[0..header.num_channels]) |*state| state.* = try .decode(self.reader);
 
         // Get sample output slice
-        const num_samples_in_frame = header.frameSampleCount();
-        const samples = list.addManyAsSliceAssumeCapacity(num_samples_in_frame);
+        const samples = list.addManyAsSliceAssumeCapacity(header.frameSampleCount());
 
         try Frame.decodeSlices(self.reader, lms[0..header.num_channels], header.num_channels, samples);
-        self.samples_decoded += @intCast(num_samples_in_frame);
+        self.samples_decoded += header.frameSampleCount();
 
         return samples;
     }
@@ -128,8 +125,6 @@ pub const FrameIter = struct {
             // read the frame header
             header = try Frame.Header.decode(self.reader);
 
-            defer self.samples_decoded += header.frameSampleCount();
-
             // Decode the lms states
             const lms_states = lms_state_buf[0..header.num_channels];
             for (lms_states) |*lms| lms.* = try .decode(self.reader);
@@ -138,6 +133,7 @@ pub const FrameIter = struct {
             const samples = list.addManyAsSliceAssumeCapacity(header.frameSampleCount());
 
             try Frame.decodeSlices(self.reader, lms_states, header.num_channels, samples);
+            self.samples_decoded += header.frameSampleCount();
         }
 
         return list.items[new_samples_start_idx..];
@@ -264,8 +260,7 @@ pub const FrameIter = struct {
                 for (lms_states) |*lms| lms.* = try .decode(&reader);
 
                 // Get sample output slice
-                const frame_sample_count = header.frameSampleCount();
-                const samples = list.addManyAsSliceAssumeCapacity(frame_sample_count);
+                const samples = list.addManyAsSliceAssumeCapacity(header.frameSampleCount());
 
                 qoa.Frame.decodeSlices(&reader, lms_states, header.num_channels, samples) catch |e| {
                     std.log.scoped(.qoa_worker).err(

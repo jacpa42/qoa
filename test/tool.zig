@@ -2,8 +2,6 @@ const std = @import("std");
 const qoa = @import("qoa");
 const zaudio = @import("zaudio");
 
-const sample_size = @sizeOf(i16);
-
 const log = std.log.scoped(.tool);
 
 pub fn main() !void {
@@ -45,14 +43,10 @@ pub fn main() !void {
     };
     defer sample_iter.deinit(gpa);
 
-    var thread_count: ?u8 = args.thread_count;
-    if (thread_count == 0) thread_count = null;
-
     log.info(
         \\
         \\┌────────────────────────────────┐
         \\│ mode           :          file │
-        \\│ num_threads    : {any:13} │
         \\│ num_channels   : {:13} │
         \\│ sample_rate_hz : {:13} │
         \\│ num_samples<   : {:13} │
@@ -61,7 +55,6 @@ pub fn main() !void {
         \\└────────────────────────────────┘
         \\
     , .{
-        thread_count,
         num_channels,
         sample_rate_hz,
         sample_iter.frame_iter.overestimateSamplesRemaining(num_channels),
@@ -77,12 +70,8 @@ pub fn main() !void {
         var device_config = zaudio.Device.Config.init(.playback);
         device_config.playback.format = zaudio.Format.signed16;
         device_config.playback.channels = num_channels;
-        const t = std.math.clamp(
-            args.speed * @as(f32, @floatFromInt(sample_rate_hz)),
-            std.math.minInt(u32),
-            std.math.maxInt(u32),
-        );
-        device_config.sample_rate = t;
+        const val = args.speed * @as(f32, @floatFromInt(sample_rate_hz));
+        device_config.sample_rate = if (val > std.math.maxInt(u24)) std.math.maxInt(u24) else @intFromFloat(val);
         device_config.data_callback = dataCallback;
         device_config.user_data = @ptrCast(&sample_iter);
 
@@ -95,9 +84,14 @@ pub fn main() !void {
             @panic("Failed to start playback device");
         };
 
-        while (device.getState() != .stopped or device.getState() != .stopping) {
-            std.Thread.sleep(20 * std.time.ns_per_ms);
-        }
+        while (true) switch (device.getState()) {
+            .uninitialized => {},
+            .starting, .started => {
+                std.Thread.sleep(20 * std.time.ns_per_ms);
+                continue;
+            },
+            .stopped, .stopping => return,
+        };
     }
 }
 
@@ -133,10 +127,8 @@ fn printHelp() !void {
         \\      tool [options] input-file
         \\OPTIONS
         \\      --help,        -h  Print this menu and exit
-        \\      --multithread, -m  Use the multithreaded decoder
         \\      --stream,      -s  Decode a single frame at a time instead of the whole file at once.
         \\      --speed,       -S  Modify the speed at which playback occurs. Accepts a floating point value.
-        \\      --threads,     -t  The number of worker threads to use with the --multithread option
         \\      --playback,    -p  Play the audio file using zaudio
         \\
     );
@@ -148,7 +140,6 @@ const Args = struct {
     playback: bool,
     stream: bool,
     speed: f32,
-    thread_count: ?u8,
     inpath: [:0]const u8,
 };
 
@@ -163,7 +154,6 @@ fn parseArgs() Error!Args {
 
     var no_arg_provided = true;
     var help = false;
-    var thread_count: ?u8 = null;
     var playback = false;
     var speed: f32 = 1;
     var stream = false;
@@ -197,25 +187,6 @@ fn parseArgs() Error!Args {
                     return e;
                 };
             }
-        } else if (eql(trimmed, "-t") or eql(trimmed, "--threads")) {
-            if (std.mem.indexOfScalar(u8, trimmed, '=')) |equal_char| {
-                thread_count = std.fmt.parseInt(u8, trimmed[equal_char + 1 ..], 10) catch |e| {
-                    log.err("Failed to parse \"{s}\" into thread count {s}", .{ trimmed[equal_char + 1 ..], @errorName(e) });
-                    return e;
-                };
-            } else { // must be next arg
-                const next = args.next() orelse {
-                    const e = error.ExpectedThreadCountValue;
-                    log.err("Failed to parse thread count {s}", .{@errorName(e)});
-                    return e;
-                };
-                trimmed = trim(next);
-
-                thread_count = std.fmt.parseInt(u8, trimmed, 10) catch |e| {
-                    log.err("Failed to parse \"{s}\" into thread count {s}", .{ trimmed, @errorName(e) });
-                    return e;
-                };
-            }
         } else {
             inpath = arg;
         }
@@ -223,7 +194,6 @@ fn parseArgs() Error!Args {
 
     return Args{
         .help = help or no_arg_provided or inpath.len == 0,
-        .thread_count = thread_count,
         .playback = playback,
         .speed = speed,
         .stream = stream,

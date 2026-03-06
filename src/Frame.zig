@@ -10,6 +10,22 @@ pub const DecodeError = error{
 
 const Frame = @This();
 
+pub const dequant_tab: [16][8]i16 = blk: {
+    const dt = [_]comptime_float{ 0.75, -0.75, 2.5, -2.5, 4.5, -4.5, 7, -7 };
+    var array: [16][8]i16 = @splat(@splat(0));
+    var sf = 0;
+    while (sf < 16) : (sf += 1) {
+        @setEvalBranchQuota(1500);
+        const scale_factor = @round(std.math.pow(f32, @as(f32, sf + 1), 2.75));
+        var qr = 0;
+        while (qr < 8) : (qr += 1) {
+            array[sf][qr] = @round(scale_factor * dt[qr]);
+        }
+    }
+
+    break :blk array;
+};
+
 /// Called after decoding the header and LmsStates
 pub fn decodeSlices(
     reader: *std.Io.Reader,
@@ -35,7 +51,7 @@ pub fn decodeSlices(
             while (sample_index < slice_end) : (sample_index += num_channels) {
                 const predicted = lms_states[channel_no].predict();
                 const quantized: u3 = @truncate(slice.data >> 61);
-                const dequantized = @as(i32, consts.dequant_tab[sf_quant][quantized]);
+                const dequantized = @as(i32, dequant_tab[sf_quant][quantized]);
                 const reconstructed = consts.clamp(predicted + dequantized);
 
                 samples[sample_index] = reconstructed;
@@ -94,8 +110,10 @@ pub const Header = packed struct(u64) {
     }
 
     /// Gets the size of the buffer required to allocate all the samples for the frame
-    pub fn frameSampleCount(self: Header) usize {
-        return @as(usize, self.samples_per_channel) * @as(usize, self.num_channels);
+    pub fn frameSampleCount(self: Header) u16 {
+        const num_samples_per_frame = self.samples_per_channel * self.num_channels;
+        std.debug.assert(num_samples_per_frame < consts.max_samples_per_frame);
+        return num_samples_per_frame;
     }
 };
 
