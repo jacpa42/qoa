@@ -5,6 +5,8 @@ const zaudio = @import("zaudio");
 const log = std.log.scoped(.tool);
 const iobuf_size = 1024;
 
+var volume: f32 = 1;
+
 pub fn main() !void {
     const gpa = std.heap.c_allocator;
 
@@ -12,12 +14,15 @@ pub fn main() !void {
     defer args.deinit(gpa);
     defer for (args.sound_files.items) |f| f.close();
 
+    volume = @abs(args.vol);
+
     if (args.help) {
         try printHelp();
         return;
     }
 
     if (args.sound_files.items.len == 0) return error.NoSoundFiles;
+    std.log.info("----------Mixing {} sounds----------", .{args.sound_files.items.len});
 
     var sample_buffers = std.ArrayList(i16).initBuffer(try gpa.alloc(i16, qoa.consts.max_samples_per_frame * args.sound_files.items.len));
     defer sample_buffers.deinit(gpa);
@@ -111,7 +116,7 @@ pub fn main() !void {
         while (true) switch (device.getState()) {
             .uninitialized => {},
             .starting, .started => {
-                std.Thread.sleep(20 * std.time.ns_per_ms);
+                std.Thread.sleep(1 * std.time.ns_per_s);
                 continue;
             },
             .stopped, .stopping => return,
@@ -125,17 +130,29 @@ fn dataCallback(
     _: ?*const anyopaque,
     frame_count: u32,
 ) callconv(.c) void {
-    const sounds: *[]qoa.SampleIter = @ptrCast(@alignCast(device.getUserData().?));
-    var output_array: [*]i16 = @ptrCast(@alignCast(pOutput orelse return));
+    const datacb_start = std.time.Instant.now() catch unreachable;
+    defer {
+        const datacb_end = std.time.Instant.now() catch unreachable;
+        log.info("dataCallback took {:.3}ms", .{
+            @as(f32, @floatFromInt(datacb_end.since(datacb_start))) / std.time.ns_per_ms,
+        });
+    }
 
-    sounds.*[0].nextSlice(output_array[0 .. frame_count * device.getPlaybackChannels()]) catch |e| {
-        log.err("Failed to write samples to output: {}", .{e});
-    };
+    const sounds_array_ptr: *[]qoa.SampleIter = @ptrCast(@alignCast(device.getUserData().?));
+    const sounds = sounds_array_ptr.*;
+    const output_array = @as([*]i16, @ptrCast(@alignCast(pOutput orelse return)))[0 .. frame_count * device.getPlaybackChannels()];
 
-    // TODO: Make mixing make sense :)
-    for (sounds.*[1..]) |*sound| {
-        for (0..frame_count * device.getPlaybackChannels()) |idx| {
-            if (sound.next() catch null) |v| output_array[idx] +|= v;
+    // TODO: Epic idea, create a buffer to mix to with float samples, write to it, then write to the output with casting. Should be cache friendly :) But ja need an extra buffer
+
+    sounds[0].nextSlice(output_array) catch unreachable;
+    for (sounds[1..]) |*sound| {
+        var output_idx: usize = 0;
+        while (output_idx < output_array.len) {
+            const samples = sound.takeSlice(output_array.len - output_idx) catch unreachable;
+            for (samples) |sample| {
+                output_array[output_idx] +|= sample;
+                output_idx += 1;
+            }
         }
     }
 }
@@ -158,6 +175,7 @@ fn printHelp() !void {
         \\OPTIONS
         \\      --help,           -h  Print this menu and exit.
         \\      --show-file-info, -S  Show file info.
+        \\      --volume,         -v  Set the volume. Accepts a floating point value [0 - 1].
         \\      --speed,          -s  Modify the speed at which playback occurs. Accepts a floating point value.
         \\      --path,           -p  Specify a qoa file to play. Multiple files can be specified to play multiple files at once.
         \\
@@ -167,6 +185,7 @@ fn printHelp() !void {
 
 const Args = struct {
     help: bool,
+    vol: f32,
     show_file_info: bool,
     speed: f32,
     sound_files: std.ArrayList(std.fs.File),
@@ -183,6 +202,7 @@ fn parseArgs(gpa: std.mem.Allocator) !Args {
 
     var no_arg_provided = true;
     var show_file_info = false;
+    var vol: f32 = 1.0;
     var help = false;
     var speed: f32 = 1;
     var inpaths: std.ArrayList(std.fs.File) = .empty;
@@ -195,6 +215,25 @@ fn parseArgs(gpa: std.mem.Allocator) !Args {
             help = true;
         } else if (startsWith(trimmed, "-S") or startsWith(trimmed, "--show-file-info")) {
             show_file_info = true;
+        } else if (startsWith(trimmed, "-v") or startsWith(trimmed, "--volume")) {
+            if (std.mem.indexOfScalar(u8, trimmed, '=')) |equal_char| {
+                vol = std.fmt.parseFloat(@TypeOf(vol), trimmed[equal_char + 1 ..]) catch |e| {
+                    log.err("Failed to parse \"{s}\" into volume {s}", .{ trimmed[equal_char + 1 ..], @errorName(e) });
+                    return e;
+                };
+            } else { // must be next arg
+                const next = args.next() orelse {
+                    const e = error.ExpectedSpeedValue;
+                    log.err("Failed to parse volume {s}", .{@errorName(e)});
+                    return e;
+                };
+                trimmed = trim(next);
+
+                vol = std.fmt.parseFloat(@TypeOf(vol), trimmed) catch |e| {
+                    log.err("Failed to parse \"{s}\" into speed {s}", .{ trimmed, @errorName(e) });
+                    return e;
+                };
+            }
         } else if (startsWith(trimmed, "-s") or startsWith(trimmed, "--speed")) {
             if (std.mem.indexOfScalar(u8, trimmed, '=')) |equal_char| {
                 speed = std.fmt.parseFloat(@TypeOf(speed), trimmed[equal_char + 1 ..]) catch |e| {
@@ -236,6 +275,7 @@ fn parseArgs(gpa: std.mem.Allocator) !Args {
 
     return Args{
         .help = help or no_arg_provided,
+        .vol = vol,
         .show_file_info = show_file_info,
         .speed = speed,
         .sound_files = inpaths,

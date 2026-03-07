@@ -347,6 +347,31 @@ pub const SampleIter = struct {
         return self.buf[self.buf_pos];
     }
 
+    /// Tries to read `size` into `self.buf`, returning the slice which is the closest size to `size` that it can achieve without rebasing.
+    ///
+    /// Returns an empty slice *only* when at the end of the stream!
+    pub fn takeSlice(self: *SampleIter, size: usize) NextError![]i16 {
+        // If we are at the end of the buffer, try advance
+        if (self.buf_pos >= self.buf_size) {
+            @branchHint(.unlikely);
+            var list = std.ArrayList(i16).initBuffer(self.buf);
+            const next_frame_samples = try self.frame_iter.nextFrame(&list);
+            // If we have reached the end of the stream, return the empty buffer
+            if (next_frame_samples.len == 0) return &.{};
+
+            self.buf_size = @intCast(next_frame_samples.len);
+            self.buf_pos = 0;
+        }
+
+        const contents = self.buf[self.buf_pos..self.buf_size];
+        const advance_len: usize = @min(contents.len, size);
+
+        if (advance_len + self.buf_pos > consts.max_samples_per_frame) unreachable;
+        defer self.buf_pos += @intCast(advance_len);
+
+        return self.buf[self.buf_pos .. self.buf_pos + advance_len];
+    }
+
     /// Reads samples until the slice is full or `EndOfStream`
     pub fn nextSlice(
         self: *SampleIter,
@@ -358,6 +383,7 @@ pub const SampleIter = struct {
             const contents = self.buf[self.buf_pos..self.buf_size];
             const copy_len = @min(buffer.len, contents.len);
             @memcpy(buffer[0..copy_len], contents[0..copy_len]);
+            if (copy_len + self.buf_pos > consts.max_samples_per_frame) unreachable;
             self.buf_pos += @intCast(copy_len);
 
             if (buffer.len == copy_len) {
@@ -369,6 +395,7 @@ pub const SampleIter = struct {
                 if (next_frame_samples.len == 0) return error.EndOfStream;
 
                 buffer = buffer[copy_len..];
+                if (next_frame_samples.len > consts.max_samples_per_frame) unreachable;
                 self.buf_size = @intCast(next_frame_samples.len);
                 self.buf_pos = 0;
             }
