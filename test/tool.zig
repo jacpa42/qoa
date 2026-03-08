@@ -7,6 +7,12 @@ const iobuf_size = 1024;
 
 var volume: f32 = 1;
 
+const SoundData = struct {
+    gpa: std.mem.Allocator,
+    sample_iters: []qoa.SampleIter,
+    mix_buffer: std.ArrayList(f32),
+};
+
 pub fn main() !void {
     const gpa = std.heap.c_allocator;
 
@@ -30,12 +36,14 @@ pub fn main() !void {
     defer gpa.free(io_buffers);
     var file_readers = try gpa.alloc(std.fs.File.Reader, args.sound_files.items.len);
     defer gpa.free(file_readers);
+    var mix_buffer = try std.ArrayList(f32).initCapacity(gpa, 2048);
+    defer mix_buffer.deinit(gpa);
 
     // TODO: Implement mixing for different number of channels
     var num_channels_opt: ?u8 = null;
     var sample_rate_hz_opt: ?u24 = null;
 
-    var sample_iters = blk: {
+    const sample_iters = blk: {
         const parse_start = std.time.Instant.now() catch unreachable;
         defer {
             const parse_end = std.time.Instant.now() catch unreachable;
@@ -67,8 +75,8 @@ pub fn main() !void {
     };
     defer gpa.free(sample_iters);
 
-    const num_channels = num_channels_opt.?;
-    const sample_rate_hz = sample_rate_hz_opt.?;
+    const num_channels = num_channels_opt orelse return error.NoSoundFiles;
+    const sample_rate_hz = sample_rate_hz_opt orelse return error.NoSoundFiles;
 
     if (args.show_file_info) for (sample_iters) |sample_iter| {
         log.info(
@@ -102,7 +110,14 @@ pub fn main() !void {
         const val = args.speed * @as(f32, @floatFromInt(sample_rate_hz));
         device_config.sample_rate = if (val > std.math.maxInt(u24)) std.math.maxInt(u24) else @intFromFloat(val);
         device_config.data_callback = dataCallback;
-        device_config.user_data = @ptrCast(&sample_iters);
+        device_config.data_callback = dataCallback;
+
+        const sound_data: SoundData = .{
+            .gpa = gpa,
+            .sample_iters = sample_iters,
+            .mix_buffer = mix_buffer,
+        };
+        device_config.user_data = @ptrCast(@constCast(&sound_data));
 
         const device = zaudio.Device.create(null, device_config) catch {
             @panic("Failed to open playback device");
@@ -124,6 +139,9 @@ pub fn main() !void {
     }
 }
 
+const max = std.math.maxInt(i16);
+const min = std.math.minInt(i16);
+
 fn dataCallback(
     device: *zaudio.Device,
     pOutput: ?*anyopaque,
@@ -138,22 +156,28 @@ fn dataCallback(
         });
     }
 
-    const sounds_array_ptr: *[]qoa.SampleIter = @ptrCast(@alignCast(device.getUserData().?));
-    const sounds = sounds_array_ptr.*;
+    const sounds_data_ptr: *SoundData = @ptrCast(@alignCast(device.getUserData().?));
     const output_array = @as([*]i16, @ptrCast(@alignCast(pOutput orelse return)))[0 .. frame_count * device.getPlaybackChannels()];
 
-    // TODO: Epic idea, create a buffer to mix to with float samples, write to it, then write to the output with casting. Should be cache friendly :) But ja need an extra buffer
+    sounds_data_ptr.mix_buffer.clearRetainingCapacity();
+    const mixing_buffer = sounds_data_ptr.mix_buffer.addManyAsSlice(sounds_data_ptr.gpa, output_array.len) catch |e| @panic(@errorName(e));
+    @memset(mixing_buffer, 0);
 
-    sounds[0].nextSlice(output_array) catch unreachable;
-    for (sounds[1..]) |*sound| {
-        var output_idx: usize = 0;
-        while (output_idx < output_array.len) {
-            const samples = sound.takeSlice(output_array.len - output_idx) catch unreachable;
-            for (samples) |sample| {
-                output_array[output_idx] +|= sample;
-                output_idx += 1;
+    const mfact = volume / (max * @as(f32, @floatFromInt(sounds_data_ptr.sample_iters.len)));
+    for (sounds_data_ptr.sample_iters) |*sound| {
+        var read: usize = 0;
+        while (read < mixing_buffer.len) {
+            const next_slice = sound.takeSlice(mixing_buffer.len - read) catch |e| @panic(@errorName(e));
+            for (next_slice) |sample_value| {
+                mixing_buffer[read] += @as(f32, @floatFromInt(sample_value)) * mfact;
+                read += 1;
             }
         }
+    }
+
+    for (mixing_buffer, output_array) |mixed, *out| {
+        const clamped: f32 = std.math.clamp(mixed * max, min, max);
+        out.* = @as(i16, @intFromFloat(clamped));
     }
 }
 

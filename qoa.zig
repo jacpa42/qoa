@@ -333,7 +333,7 @@ pub const SampleIter = struct {
         gpa.free(self.buf);
     }
 
-    pub fn next(self: *SampleIter) NextError!?i16 {
+    pub fn take(self: *SampleIter) NextError!?i16 {
         if (self.buf_pos >= self.buf_size) {
             var list = std.ArrayList(i16).initBuffer(self.buf);
             const next_frame_samples = try self.frame_iter.nextFrame(&list);
@@ -371,34 +371,71 @@ pub const SampleIter = struct {
 
         return self.buf[self.buf_pos .. self.buf_pos + advance_len];
     }
+};
 
-    /// Reads samples until the slice is full or `EndOfStream`
-    pub fn nextSlice(
-        self: *SampleIter,
-        output: []i16,
-    ) (error{EndOfStream} || NextError)!void {
-        var buffer = output;
+/// Walks over a decoded sound rather than an encoded one
+pub const StaticSampleIter = struct {
+    sample_list: std.ArrayList(i16),
+    pos: usize,
 
-        while (buffer.len > 0) {
-            const contents = self.buf[self.buf_pos..self.buf_size];
-            const copy_len = @min(buffer.len, contents.len);
-            @memcpy(buffer[0..copy_len], contents[0..copy_len]);
-            if (copy_len + self.buf_pos > consts.max_samples_per_frame) unreachable;
-            self.buf_pos += @intCast(copy_len);
+    pub const InitError = FrameIter.InitError || FrameIter.DecodeError || error{OutOfMemory};
 
-            if (buffer.len == copy_len) {
-                @branchHint(.likely);
-                return;
-            } else { // Advance the frame position
-                var list = std.ArrayList(i16).initBuffer(self.buf);
-                const next_frame_samples = try self.frame_iter.nextFrame(&list);
-                if (next_frame_samples.len == 0) return error.EndOfStream;
+    /// NOTE: Reader must be at the start of the file.
+    ///
+    /// Initializes the iterator and returns the first frame header which will come in handy when decoding.
+    pub fn init(
+        reader: std.Io.Reader,
+        gpa: std.mem.Allocator,
+    ) InitError!StaticSampleIter {
+        const frame_header, var frame_iter = try FrameIter.init(reader);
 
-                buffer = buffer[copy_len..];
-                if (next_frame_samples.len > consts.max_samples_per_frame) unreachable;
-                self.buf_size = @intCast(next_frame_samples.len);
-                self.buf_pos = 0;
-            }
+        const sample_list_size = frame_iter.overestimateSamplesRemaining(frame_header.num_channels);
+        const buf = try gpa.alloc(i16, sample_list_size);
+
+        return StaticSampleIter.initFrameIter(&frame_iter, buf);
+    }
+
+    /// Uses the frame iter to decode the rest of the samples into the buffer.
+    ///
+    /// See `FrameIter.overestimateSamplesRemaining` for the expected buffer size.
+    pub fn initFrameIter(frame_iter: *FrameIter, buf: []i16) FrameIter.DecodeError!StaticSampleIter {
+        var sample_list = std.ArrayList(i16).initBuffer(buf);
+        try frame_iter.decodeRemaining(&sample_list);
+        return StaticSampleIter{ .sample_list = sample_list, .pos = 0 };
+    }
+
+    pub fn deinit(self: StaticSampleIter, gpa: std.mem.Allocator) void {
+        self.sample_list.deinit(gpa);
+    }
+
+    pub fn reset(self: *StaticSampleIter) void {
+        self.pos = 0;
+    }
+
+    pub fn take(self: *StaticSampleIter) ?i16 {
+        if (self.pos >= self.sample_list.items.len) {
+            @branchHint(.unlikely);
+            return null;
         }
+
+        defer self.pos += 1;
+        return self.sample_list.items[self.pos];
+    }
+
+    /// Tries to read `size` into `self.buf`, returning the slice which is the closest size to `size` that it can achieve without rebasing.
+    ///
+    /// Returns an empty slice *only* when at the end of the stream!
+    pub fn takeSlice(self: *StaticSampleIter, size: usize) []i16 {
+        if (self.pos >= self.sample_list.items.len) {
+            @branchHint(.unlikely);
+            return &.{};
+        }
+
+        const contents = self.sample_list.items[self.pos..];
+        const advance_len: usize = @min(contents.len, size);
+        std.debug.assert(advance_len > 0);
+
+        defer self.pos += advance_len;
+        return self.buf[self.pos .. self.pos + advance_len];
     }
 };
