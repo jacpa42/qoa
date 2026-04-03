@@ -453,7 +453,7 @@ pub const StaticSampleIter = struct {
         self.samples.deinit(gpa);
     }
 
-    /// Tries to read `size` into `self.buf`, returning the slice which is the
+    /// Tries to read `size` into `self.samples`, returning the slice which is the
     /// closest size to `size`. May hit the end of the buffer.
     ///
     /// Returns an empty slice *only* when at the end of the sound!
@@ -468,10 +468,10 @@ pub const StaticSampleIter = struct {
         std.debug.assert(advance_len > 0);
 
         defer self.pos += advance_len;
-        return self.buf[self.pos .. self.pos + advance_len];
+        return self.samples[self.pos .. self.pos + advance_len];
     }
 
-    /// Tries to read `size` into `self.buf`, returning the slice which is the
+    /// Tries to read `size` into `self.samples` returning the slice which is the
     /// closest size to `size`. May hit the end of the buffer.
     ///
     /// Never returns an empty slice. Instead it wraps around to the start of
@@ -484,6 +484,6 @@ pub const StaticSampleIter = struct {
         std.debug.assert(advance_len > 0);
 
         defer self.pos += advance_len;
-        return self.buf[self.pos .. self.pos + advance_len];
+        return self.samples[self.pos .. self.pos + advance_len];
     }
 };
