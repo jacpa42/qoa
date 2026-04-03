@@ -454,14 +454,30 @@ pub const StaticSampleIter = struct {
     }
 
     /// Tries to read `size` into `self.buf`, returning the slice which is the
-    /// closest size to `size` that it can achieve without rebasing.
+    /// closest size to `size`. May hit the end of the buffer.
     ///
-    /// Returns an empty slice *only* when at the end of the stream!
+    /// Returns an empty slice *only* when at the end of the sound!
     pub fn takeSlice(self: *StaticSampleIter, size: usize) []i16 {
         if (self.pos >= self.samples.len) {
             @branchHint(.unlikely);
             return &.{};
         }
+
+        const contents = self.samples[self.pos..];
+        const advance_len: usize = @min(contents.len, size);
+        std.debug.assert(advance_len > 0);
+
+        defer self.pos += advance_len;
+        return self.buf[self.pos .. self.pos + advance_len];
+    }
+
+    /// Tries to read `size` into `self.buf`, returning the slice which is the
+    /// closest size to `size`. May hit the end of the buffer.
+    ///
+    /// Never returns an empty slice. Instead it wraps around to the start of
+    /// the sample list
+    pub fn takeSliceLooping(self: *StaticSampleIter, size: usize) []i16 {
+        if (self.pos >= self.samples.len) self.pos = 0;
 
         const contents = self.samples[self.pos..];
         const advance_len: usize = @min(contents.len, size);
