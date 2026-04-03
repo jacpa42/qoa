@@ -406,7 +406,7 @@ pub const SampleIter = struct {
 
 /// Walks over a decoded sound rather than an encoded one.
 pub const StaticSampleIter = struct {
-    sample_list: std.ArrayList(i16),
+    samples: []i16,
 
     /// Just an index into the `sample_list`. Can be modified directly to change
     /// the position of the sound
@@ -444,21 +444,13 @@ pub const StaticSampleIter = struct {
         const sample_list_size = frame_iter.overestimateSamplesRemaining(frame_header.num_channels);
         const buf = try gpa.alloc(i16, sample_list_size);
 
-        return StaticSampleIter.initFrameIter(&frame_iter, buf);
-    }
-
-    /// Uses the frame iter to decode the rest of the samples into the buffer.
-    ///
-    /// See `FrameIter.overestimateSamplesRemaining` for the expected buffer
-    /// size.
-    pub fn initFrameIter(frame_iter: *FrameIter, buf: []i16) FrameIter.DecodeError!StaticSampleIter {
         var sample_list = std.ArrayList(i16).initBuffer(buf);
         try frame_iter.decodeRemaining(&sample_list);
-        return StaticSampleIter{ .sample_list = sample_list, .pos = 0 };
+        return StaticSampleIter{ .samples = try sample_list.toOwnedSlice(gpa), .pos = 0 };
     }
 
     pub fn deinit(self: StaticSampleIter, gpa: std.mem.Allocator) void {
-        self.sample_list.deinit(gpa);
+        self.samples.deinit(gpa);
     }
 
     /// Tries to read `size` into `self.buf`, returning the slice which is the
@@ -466,12 +458,12 @@ pub const StaticSampleIter = struct {
     ///
     /// Returns an empty slice *only* when at the end of the stream!
     pub fn takeSlice(self: *StaticSampleIter, size: usize) []i16 {
-        if (self.pos >= self.sample_list.items.len) {
+        if (self.pos >= self.samples.len) {
             @branchHint(.unlikely);
             return &.{};
         }
 
-        const contents = self.sample_list.items[self.pos..];
+        const contents = self.samples[self.pos..];
         const advance_len: usize = @min(contents.len, size);
         std.debug.assert(advance_len > 0);
 
