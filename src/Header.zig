@@ -30,9 +30,10 @@ pub const SamplesPerChannel = enum(u32) {
         return @enumFromInt(try reader.takeInt(u32, .big));
     }
 
-    /// Returns the number of frames per channel in the whole file rounded up.
-    /// Not known if streaming.
     const max_samples_per_frame = consts.num_samples_in_slice * consts.max_slices_per_frame;
+
+    /// Returns the number of frames per channel in the whole file rounded up.
+    /// `null` iff streaming.
     pub fn totalFramesPerChannel(self: SamplesPerChannel) ?u32 {
         return switch (self) {
             .streaming => null,

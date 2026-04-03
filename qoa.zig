@@ -9,14 +9,23 @@ test {
     std.testing.refAllDecls(@This());
 }
 
-// For most applications you want to be able to feed samples to a sink. For qoa the logical design then is to have a structure which wraps `std.Io.Reader` and allows you to extract some number of samples at a time until the end of sound.
+// For most use cases I want to be able to feed samples to a sink. For qoa the
+// logical design then is to have a structure which wraps `std.Io.Reader` and
+// allows you to extract some number of samples at a time until the end of
+// sound.
 //
-// You might want to read decode the whole file into memory to say, convert it to another file format or store it in this state. This should be function which takes in a reader and spits out all relevant data.
+// You might want to read decode the whole file into memory to say, convert it
+// to another file format or store it in this state. This should be function
+// which takes in a reader and spits out all relevant data.
 //
-// I will ignore streaming mode for now.
+// TODO: Implement streaming mode.
 
 const qoa = @This();
 
+/// Iterates over the audio frames of a `qoa` file.
+///
+/// Can also be used to decode the entire audio stream into memory. See
+/// `FrameIter.decodeRemaining`
 pub const FrameIter = struct {
     reader: *std.Io.Reader,
     /// Total samples decoded from reader so far
@@ -28,7 +37,8 @@ pub const FrameIter = struct {
 
     /// NOTE: Reader must be at the start of the file.
     ///
-    /// Initializes the iterator and returns the first frame header which will come in handy when decoding.
+    /// Initializes the iterator and returns the first frame header which will
+    /// come in handy when decoding.
     pub fn init(reader: *std.Io.Reader) InitError!struct { Frame.Header, FrameIter } {
         const header = try Header.decode(reader);
 
@@ -48,7 +58,8 @@ pub const FrameIter = struct {
 
     pub fn overestimateSamplesRemaining(self: *const FrameIter, num_channels: u8) usize {
         assert(self.total_samples_per_channel != .streaming);
-        assert(@intFromEnum(self.total_samples_per_channel) >= 1); // same as above :)
+        assert(@intFromEnum(self.total_samples_per_channel) >= 1); // same as
+        // above :)
 
         const total_frames_per_channel = self.total_samples_per_channel.totalFramesPerChannel() orelse unreachable;
         const overestimated_total_samples_in_whole_file =
@@ -67,10 +78,12 @@ pub const FrameIter = struct {
         list: *std.ArrayList(i16),
     ) DecodeError![]i16 {
         assert(self.total_samples_per_channel != .streaming);
-        assert(@intFromEnum(self.total_samples_per_channel) >= 1); // same as above :)
+        assert(@intFromEnum(self.total_samples_per_channel) >= 1); // same as
+        // above :)
 
         const header = Frame.Header.decode(self.reader) catch |e| {
-            if (e == error.EndOfStream) return &.{}; // This must be the end of the file
+            if (e == error.EndOfStream) return &.{}; // This must be the end of
+            // the file
             return e; // Else some nefarious error occurred.
         };
 
@@ -90,8 +103,8 @@ pub const FrameIter = struct {
 
     /// Decodes all the remaining frames and appends them to the array list.
     ///
-    /// The reason this doesn't accept an allocator is because you should probably reserve
-    /// `Iter.overestimateSamplesRemaining` extra samples.
+    /// The reason this doesn't accept an allocator is because you should
+    /// probably reserve `Iter.overestimateSamplesRemaining` extra samples.
     ///
     /// Returns the slice of decoded samples.
     ///
@@ -101,10 +114,12 @@ pub const FrameIter = struct {
         list: *std.ArrayList(i16),
     ) DecodeError![]i16 {
         assert(self.total_samples_per_channel != .streaming);
-        assert(@intFromEnum(self.total_samples_per_channel) >= 1); // same as above :)
+        assert(@intFromEnum(self.total_samples_per_channel) >= 1); // same as
+        // above :)
 
         var header = Frame.Header.peek(self.reader) catch |e| {
-            if (e == error.EndOfStream) return &.{}; // This must be the end of the file
+            if (e == error.EndOfStream) return &.{}; // This must be the end of
+            // the file
             return e; // Else some nefarious error occurred.
         };
 
@@ -139,12 +154,15 @@ pub const FrameIter = struct {
         return list.items[new_samples_start_idx..];
     }
 
-    /// NOTE: This will probably fail if the frame iter was initialized with a reader that has a shared buffer. This function copies the reader to each thread which means that they will overwrite each others data and cause all sorts of weirdness. I recommend `std.Io.Reader.fixed`
+    /// NOTE: This will probably fail if the frame iter was initialized with a
+    /// reader that has a shared buffer. This function copies the reader to each
+    /// thread which means that they will overwrite each others data and cause
+    /// all sorts of weirdness. I recommend `std.Io.Reader.fixed`.
     ///
     /// Decodes all the remaining frames and appends them to the array list.
     ///
-    /// The reason this doesn't accept an allocator is because you should probably reserve
-    /// `Iter.overestimateSamplesRemaining` extra samples.
+    /// The reason this doesn't accept an allocator is because you should
+    /// probably reserve `Iter.overestimateSamplesRemaining` extra samples.
     ///
     /// Returns the slice of decoded samples.
     ///
@@ -163,7 +181,8 @@ pub const FrameIter = struct {
             @divFloor(self.samples_decoded, consts.max_samples_per_frame);
 
         const header = Frame.Header.peek(self.reader) catch |e| {
-            if (e == error.EndOfStream) return &.{}; // This must be the end of the file
+            if (e == error.EndOfStream) return &.{}; // This must be the end of
+            // the file
             return e; // Else some nefarious error occurred.
         };
 
@@ -198,7 +217,8 @@ pub const FrameIter = struct {
             InvalidFileFormat,
             OutOfMemory,
 
-            /// When the decoder expected a file and finds a streamer then it can't decode as if it where decoding a file.
+            /// When the decoder expected a file and finds a streamer then it
+            /// can't decode as if it where decoding a file.
             ExpectedFileFoundStream,
         } || std.Io.Reader.Error;
 
@@ -224,8 +244,12 @@ pub const FrameIter = struct {
 
                 const samples_per_worker =
                     (frames_per_worker_per_channel + add_one) *
-                    consts.max_slices_per_frame * consts.num_samples_in_slice * // -> max samples per frame
-                    num_channels; // 1 i16 per channel -> total length of output slice
+                    consts.max_slices_per_frame * consts.num_samples_in_slice * // ->
+                    // max
+                    // samples
+                    // per frame
+                    num_channels; // 1 i16 per channel -> total length of output
+                // slice
 
                 const output_slice = try sample_list.addManyAsSliceBounded(samples_per_worker);
                 workers[worker_id] = try std.Thread.spawn(
@@ -304,14 +328,20 @@ pub const SampleIter = struct {
 
     /// NOTE: Reader must be at the start of the file.
     ///
-    /// Initializes the iterator and returns the first frame header which will come in handy when decoding.
+    /// Allocator is used to allocate a buffer for the samples. Allocation is
+    /// done once.
+    ///
+    /// Initializes the iterator and returns the first frame header which will
+    /// come in handy when decoding.
     pub fn init(
         reader: std.Io.Reader,
         gpa: std.mem.Allocator,
     ) InitError!SampleIter {
         const frame_header, const frame_iter = try FrameIter.init(reader);
 
-        // NOTE: as we are *not* in streaming mode, we can use the number of samples in the first frame as the upper bound for samples in the whole file.
+        // NOTE: as we are *not* in streaming mode, we can use the number of
+        // samples in the first frame as the upper bound for samples in the
+        // whole file.
         const buf = try gpa.alloc(i16, frame_header.frameSampleCount());
 
         return SampleIter.initFrameIter(frame_iter, buf);
@@ -347,7 +377,8 @@ pub const SampleIter = struct {
         return self.buf[self.buf_pos];
     }
 
-    /// Tries to read `size` into `self.buf`, returning the slice which is the closest size to `size` that it can achieve without rebasing.
+    /// Tries to read `size` into `self.buf`, returning the slice which is the
+    /// closest size to `size` that it can achieve without rebasing.
     ///
     /// Returns an empty slice *only* when at the end of the stream!
     pub fn takeSlice(self: *SampleIter, size: usize) NextError![]i16 {
@@ -373,17 +404,38 @@ pub const SampleIter = struct {
     }
 };
 
-/// Walks over a decoded sound rather than an encoded one
+/// Walks over a decoded sound rather than an encoded one.
 pub const StaticSampleIter = struct {
     sample_list: std.ArrayList(i16),
+
+    /// Just an index into the `sample_list`. Can be modified directly to change
+    /// the position of the sound
     pos: usize,
 
     pub const InitError = FrameIter.InitError || FrameIter.DecodeError || error{OutOfMemory};
 
     /// NOTE: Reader must be at the start of the file.
     ///
-    /// Initializes the iterator and returns the first frame header which will come in handy when decoding.
-    pub fn init(
+    /// Initializes the iterator and returns the first frame header which will
+    /// come in handy when decoding.
+    pub fn initPath(
+        sub_path: []const u8,
+        gpa: std.mem.Allocator,
+    ) (std.fs.File.OpenError || InitError)!StaticSampleIter {
+        const file = try std.fs.cwd().openFile(sub_path, .{});
+        defer file.close();
+
+        var iobuf: [1024]u8 = undefined;
+        var reader = file.reader(&iobuf);
+
+        return .initReader(&reader.interface, gpa);
+    }
+
+    /// NOTE: Reader must be at the start of the file.
+    ///
+    /// Initializes the iterator and returns the first frame header which will
+    /// come in handy when decoding.
+    pub fn initReader(
         reader: std.Io.Reader,
         gpa: std.mem.Allocator,
     ) InitError!StaticSampleIter {
@@ -397,7 +449,8 @@ pub const StaticSampleIter = struct {
 
     /// Uses the frame iter to decode the rest of the samples into the buffer.
     ///
-    /// See `FrameIter.overestimateSamplesRemaining` for the expected buffer size.
+    /// See `FrameIter.overestimateSamplesRemaining` for the expected buffer
+    /// size.
     pub fn initFrameIter(frame_iter: *FrameIter, buf: []i16) FrameIter.DecodeError!StaticSampleIter {
         var sample_list = std.ArrayList(i16).initBuffer(buf);
         try frame_iter.decodeRemaining(&sample_list);
@@ -408,21 +461,8 @@ pub const StaticSampleIter = struct {
         self.sample_list.deinit(gpa);
     }
 
-    pub fn reset(self: *StaticSampleIter) void {
-        self.pos = 0;
-    }
-
-    pub fn take(self: *StaticSampleIter) ?i16 {
-        if (self.pos >= self.sample_list.items.len) {
-            @branchHint(.unlikely);
-            return null;
-        }
-
-        defer self.pos += 1;
-        return self.sample_list.items[self.pos];
-    }
-
-    /// Tries to read `size` into `self.buf`, returning the slice which is the closest size to `size` that it can achieve without rebasing.
+    /// Tries to read `size` into `self.buf`, returning the slice which is the
+    /// closest size to `size` that it can achieve without rebasing.
     ///
     /// Returns an empty slice *only* when at the end of the stream!
     pub fn takeSlice(self: *StaticSampleIter, size: usize) []i16 {
