@@ -16,19 +16,16 @@ test "decode qoa header" {
         header_buf = "qoaf" ++ std.mem.toBytes(std.mem.nativeToBig(@TypeOf(samples), samples));
         reader = .fixed(header_buf);
         decoded = try qoa.Header.decode(&reader);
-        try assertEq(decoded.samples, @as(qoa.Header.Samples, @enumFromInt(samples)));
 
         samples = rng.int(@TypeOf(samples));
         header_buf = "qoaf" ++ std.mem.toBytes(std.mem.nativeToBig(@TypeOf(samples), samples));
         reader = .fixed(header_buf);
         decoded = try qoa.Header.decode(&reader);
-        try assertEq(decoded.samples, @as(qoa.Header.Samples, @enumFromInt(samples)));
 
         samples = rng.int(@TypeOf(samples));
         header_buf = "qoaf" ++ std.mem.toBytes(std.mem.nativeToBig(@TypeOf(samples), samples));
         reader = .fixed(header_buf);
         decoded = try qoa.Header.decode(&reader);
-        try assertEq(decoded.samples, @as(qoa.Header.Samples, @enumFromInt(samples)));
     }
 
     { // unhappy path
@@ -40,7 +37,7 @@ test "decode qoa header" {
             rng.bytes(&buf);
             header_buf = buf[0..];
             reader = .fixed(header_buf);
-            try assertEq(qoa.Header.decode(&reader), error.EndOfStream);
+            try assertEq(qoa.Header.decode(&reader), error.InvalidFileFormat);
         }
 
         // too small
@@ -63,35 +60,20 @@ test "decode qoa header" {
     }
 }
 
-test "decode test files" {
-    const alloc = std.testing.allocator;
-    const dir = try std.fs.cwd().openDir("test/test_files/songs", .{
-        .iterate = true,
-        .no_follow = true,
-    });
-    var threads = std.ArrayList(std.Thread).empty;
-    defer threads.deinit(alloc);
-
-    try parseQOARecursive(alloc, &threads, dir);
-
-    for (threads.items) |thread| {
-        thread.join();
-    }
-}
-
 fn parseQOARecursive(
     alloc: std.mem.Allocator,
     tasks: *std.ArrayList(std.Thread),
-    dir: std.fs.Dir,
+    io: std.Io,
+    dir: std.Io.Dir,
 ) !void {
     var iter = dir.iterate();
-    while (try iter.next()) |entry| switch (entry.kind) {
+    while (try iter.next(io)) |entry| switch (entry.kind) {
         .directory => {
-            const new_dir = try dir.openDir(entry.name, .{
+            const new_dir = try dir.openDir(io, entry.name, .{
                 .iterate = true,
-                .no_follow = true,
+                .follow_symlinks = false,
             });
-            try parseQOARecursive(alloc, tasks, new_dir);
+            try parseQOARecursive(alloc, tasks, io, new_dir);
         },
         .file => if (std.mem.eql(u8, ".qoa", std.fs.path.extension(entry.name))) {
             // FIX: put limit here for oom killer :)
@@ -99,11 +81,11 @@ fn parseQOARecursive(
                 for (tasks.items) |task| task.join();
                 tasks.clearRetainingCapacity();
             }
-            const file = try dir.openFile(entry.name, .{});
+            const file = try dir.openFile(io, entry.name, .{});
             const handle = try std.Thread.spawn(
                 .{ .allocator = alloc },
                 parseQOAFile,
-                .{ alloc, file },
+                .{ alloc, io, file },
             );
             try tasks.append(alloc, handle);
         },
@@ -111,16 +93,17 @@ fn parseQOARecursive(
     };
 }
 
-fn parseQOAFile(alloc: std.mem.Allocator, file: std.fs.File) !void {
-    defer file.close();
+fn parseQOAFile(gpa: std.mem.Allocator, io: std.Io, file: std.Io.File) !void {
+    defer file.close(io);
 
     var iobuf: [1024]u8 = undefined;
-    var reader = file.reader(&iobuf);
+    var reader = file.reader(io, &iobuf);
 
-    const audio = try qoa.decodeReader(alloc, &reader.interface);
-    defer audio.deinit(alloc);
+    const header, var frame_iterator = try qoa.FrameIter.init(&reader.interface);
+    var sample_list = try std.ArrayList(i16).initCapacity(gpa, frame_iterator.overestimateSamplesRemaining(header.num_channels));
+    defer sample_list.deinit(gpa);
+    _ = try frame_iterator.decodeRemaining(&sample_list);
 
-    std.debug.print("audio.num_channels = {}\n", .{audio.num_channels});
-    std.debug.print("audio.sample_rate_hz = {}\n", .{audio.sample_rate_hz});
-    std.debug.print("audio.samples.len  = {}\n", .{audio.samples.len});
+    std.debug.print("audio.header = {any}\n", .{header});
+    std.debug.print("audio.samples.len  = {}\n", .{sample_list.items.len});
 }

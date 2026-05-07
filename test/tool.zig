@@ -5,6 +5,7 @@ const zaudio = @import("zaudio");
 const log = std.log.scoped(.tool);
 const iobuf_size = 1024;
 
+var io: std.Io = .failing;
 var volume: f32 = 1;
 
 const SoundData = struct {
@@ -13,14 +14,12 @@ const SoundData = struct {
     mix_buffer: std.ArrayList(f32),
 };
 
-pub fn main() !void {
-    const gpa = std.heap.c_allocator;
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    io = init.io;
 
-    var args = try parseArgs(gpa);
-    defer args.deinit(gpa);
-    defer for (args.sound_files.items) |f| f.close();
-
-    volume = @abs(args.vol);
+    var args = try parseArgs(init);
+    defer args.deinit(init.gpa);
 
     if (args.help) {
         try printHelp();
@@ -34,7 +33,7 @@ pub fn main() !void {
     defer sample_buffers.deinit(gpa);
     var io_buffers = try gpa.alloc(u8, args.sound_files.items.len * iobuf_size);
     defer gpa.free(io_buffers);
-    var file_readers = try gpa.alloc(std.fs.File.Reader, args.sound_files.items.len);
+    var file_readers = try gpa.alloc(std.Io.File.Reader, args.sound_files.items.len);
     defer gpa.free(file_readers);
     var mix_buffer = try std.ArrayList(f32).initCapacity(gpa, 2048);
     defer mix_buffer.deinit(gpa);
@@ -44,18 +43,17 @@ pub fn main() !void {
     var sample_rate_hz_opt: ?u24 = null;
 
     const sample_iters = blk: {
-        const parse_start = std.time.Instant.now() catch unreachable;
+        const parse_start = std.Io.Timestamp.now(io, .cpu_thread);
         defer {
-            const parse_end = std.time.Instant.now() catch unreachable;
-            log.info("Loaded in {:.3}ms", .{
-                @as(f32, @floatFromInt(parse_end.since(parse_start))) / std.time.ns_per_ms,
-            });
+            const parse_end = std.Io.Timestamp.now(io, .cpu_thread);
+
+            log.info("Loaded in {f}", .{parse_start.durationTo(parse_end)});
         }
 
         const sample_iters = try gpa.alloc(qoa.SampleIter, args.sound_files.items.len);
         for (0.., args.sound_files.items, sample_iters) |i, file, *sample_iter| {
             const iobuf = io_buffers[i * iobuf_size .. (i + 1) * iobuf_size];
-            file_readers[i] = file.reader(iobuf);
+            file_readers[i] = file.reader(io, iobuf);
 
             const frame_header, const frame_iter = try qoa.FrameIter.init(&file_readers[i].interface);
 
@@ -131,7 +129,7 @@ pub fn main() !void {
         while (true) switch (device.getState()) {
             .uninitialized => {},
             .starting, .started => {
-                std.Thread.sleep(1 * std.time.ns_per_s);
+                io.sleep(.fromSeconds(1), .cpu_thread) catch {};
                 continue;
             },
             .stopped, .stopping => return,
@@ -148,12 +146,10 @@ fn dataCallback(
     _: ?*const anyopaque,
     frame_count: u32,
 ) callconv(.c) void {
-    const datacb_start = std.time.Instant.now() catch unreachable;
+    const start = std.Io.Timestamp.now(io, .cpu_thread);
     defer {
-        const datacb_end = std.time.Instant.now() catch unreachable;
-        log.info("dataCallback took {:.3}ms", .{
-            @as(f32, @floatFromInt(datacb_end.since(datacb_start))) / std.time.ns_per_ms,
-        });
+        const end = std.Io.Timestamp.now(io, .cpu_thread);
+        log.info("dataCallback took {f}", .{start.durationTo(end)});
     }
 
     const sounds_data_ptr: *SoundData = @ptrCast(@alignCast(device.getUserData().?));
@@ -190,7 +186,7 @@ fn startsWith(l: []const u8, r: []const u8) bool {
 }
 
 fn printHelp() !void {
-    var writer = std.fs.File.stderr().writer(&.{});
+    var writer = std.Io.File.stderr().writer(io, &.{});
     try writer.interface.writeAll(
         \\Epic qoa tool. Takes in an input file and plays it back
         \\
@@ -212,25 +208,27 @@ const Args = struct {
     vol: f32,
     show_file_info: bool,
     speed: f32,
-    sound_files: std.ArrayList(std.fs.File),
+    sound_files: std.ArrayList(std.Io.File),
 
     pub fn deinit(self: *Args, gpa: std.mem.Allocator) void {
-        for (self.sound_files.items) |f| f.close();
+        for (self.sound_files.items) |f| f.close(io);
         self.sound_files.deinit(gpa);
     }
 };
 
-fn parseArgs(gpa: std.mem.Allocator) !Args {
-    var args = std.process.args();
-    _ = args.next();
+fn parseArgs(init: std.process.Init) !Args {
+    var args = init.minimal.args.iterate();
+    _ = args.skip();
 
     var no_arg_provided = true;
     var show_file_info = false;
     var vol: f32 = 1.0;
     var help = false;
     var speed: f32 = 1;
-    var inpaths: std.ArrayList(std.fs.File) = .empty;
-    errdefer for (inpaths.items) |f| f.close();
+    var inpaths: std.ArrayList(std.Io.File) = .empty;
+    errdefer for (inpaths.items) |f| f.close(io);
+
+    defer volume = @abs(vol);
 
     while (args.next()) |arg| {
         no_arg_provided = false;
@@ -279,7 +277,7 @@ fn parseArgs(gpa: std.mem.Allocator) !Args {
             }
         } else if (startsWith(trimmed, "-p") or startsWith(trimmed, "--path")) {
             if (std.mem.indexOfScalar(u8, trimmed, '=')) |equal_char| {
-                try inpaths.append(gpa, try std.fs.cwd().openFile(trimmed[equal_char + 1 ..], .{}));
+                try inpaths.append(init.gpa, try std.Io.Dir.cwd().openFile(io, trimmed[equal_char + 1 ..], .{}));
             } else { // must be next arg
                 const next = args.next() orelse {
                     const e = error.ExpectedQoaFilePath;
@@ -288,7 +286,7 @@ fn parseArgs(gpa: std.mem.Allocator) !Args {
                 };
                 trimmed = trim(next);
 
-                try inpaths.append(gpa, try std.fs.cwd().openFile(trimmed, .{}));
+                try inpaths.append(init.gpa, try std.Io.Dir.cwd().openFile(io, trimmed, .{}));
             }
         } else {
             log.warn("Unknown argument: \"{s}\"", .{trimmed});

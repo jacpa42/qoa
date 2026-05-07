@@ -45,9 +45,7 @@ pub const SamplesPerChannel = enum(u32) {
     }
 };
 
-pub fn checkMagic(
-    reader: *std.Io.Reader,
-) DecodeError!void {
+pub fn checkMagic(reader: *std.Io.Reader) DecodeError!void {
     if (!std.mem.eql(u8, try reader.takeArray(4), magic)) {
         return error.InvalidFileFormat;
     }

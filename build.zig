@@ -42,22 +42,22 @@ fn makePlaybackTool(
         .target = args.target,
         .optimize = args.optimize,
     });
+    const tool_rootmod = b.addModule("tool", .{
+        .root_source_file = b.path("test/tool.zig"),
+        .target = args.target,
+        .optimize = args.optimize,
+        .strip = args.optimize == .ReleaseFast or args.optimize == .ReleaseSmall,
+        .imports = &.{
+            .{ .name = "qoa", .module = qoa },
+            .{ .name = "zaudio", .module = zaudio.module("root") },
+        },
+    });
+    tool_rootmod.linkLibrary(zaudio.artifact("miniaudio"));
+
     const tool_exe = b.addExecutable(.{
         .name = "tool",
-        .root_module = b.addModule("tool", .{
-            .root_source_file = b.path("test/tool.zig"),
-            .target = args.target,
-            .optimize = args.optimize,
-            .strip = args.optimize == .ReleaseFast or args.optimize == .ReleaseSmall,
-
-            .imports = &.{
-                .{ .name = "qoa", .module = qoa },
-                .{ .name = "zaudio", .module = zaudio.module("root") },
-            },
-        }),
+        .root_module = tool_rootmod,
     });
-
-    tool_exe.linkLibrary(zaudio.artifact("miniaudio"));
 
     const tool_step = b.step("tool", "Use playback tool (-h for usage)");
     const run_tool = b.addRunArtifact(tool_exe);

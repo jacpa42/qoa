@@ -1,6 +1,7 @@
-.zig-cache/
-zig-out/
-images/
+.zig-cache
+zig-pkg
+zig-out
+images
 **.pdf
 **/.DS_Store
 **.wav
