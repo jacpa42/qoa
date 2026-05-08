@@ -55,7 +55,8 @@ pub fn main(init: std.process.Init) !void {
             const iobuf = io_buffers[i * iobuf_size .. (i + 1) * iobuf_size];
             file_readers[i] = file.reader(io, iobuf);
 
-            const frame_header, const frame_iter = try qoa.FrameIter.init(&file_readers[i].interface);
+            const frame_iter = try qoa.FrameIter.init(&file_readers[i].interface);
+            const frame_header = try frame_iter.peekFrameHeader();
 
             if (num_channels_opt) |c| {
                 if (frame_header.num_channels != c) return error.NotAllFilesHaveSameNumberOfChannels;

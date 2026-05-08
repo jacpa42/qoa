@@ -1,7 +1,8 @@
 const std = @import("std");
 const qoa = @This();
 
-pub const native_endian = @import("builtin").cpu.arch.endian();
+pub const encode_endian = std.builtin.Endian.big;
+pub const native_endian = std.builtin.Endian.native;
 pub const max_decode_channels = 8;
 pub const max_slices_per_frame = 256;
 pub const num_samples_in_slice = 20;

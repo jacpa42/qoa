@@ -41,7 +41,7 @@ pub fn decodeSlices(
         defer samples_computed += values_per_slice;
 
         for (0..num_channels) |channel_no| {
-            var slice = try Slice.decode(reader);
+            var slice = try Slice.take(reader);
             const sf_quant: u4 = @truncate(slice.data >> 60);
             slice.data <<= 4;
 
@@ -67,8 +67,8 @@ pub const Slice = packed struct {
     data: u64,
 
     pub const DecodeError = error{ ReadFailed, EndOfStream };
-    pub fn decode(reader: *std.Io.Reader) Slice.DecodeError!Slice {
-        return @bitCast(try reader.takeInt(u64, .big));
+    pub fn take(reader: *std.Io.Reader) Slice.DecodeError!Slice {
+        return @bitCast(try reader.takeInt(u64, consts.encode_endian));
     }
 };
 
@@ -83,30 +83,24 @@ pub const Header = packed struct(u64) {
         EndOfStream,
     };
 
-    pub fn decode(
-        reader: *std.Io.Reader,
-    ) Header.DecodeError!Header {
-        var header: Header =
-            @bitCast((try reader.takeArray(@sizeOf(Header))).*);
-
-        if (consts.native_endian != .big) {
-            std.mem.byteSwapAllFields(Header, &header);
-        }
-
+    pub fn take(reader: *std.Io.Reader) Header.DecodeError!Header {
+        var header: Header = @bitCast((try reader.takeArray(@sizeOf(Header))).*);
+        maybeByteSwap(&header);
         return header;
     }
 
-    pub fn peek(
-        reader: *std.Io.Reader,
-    ) Header.DecodeError!Header {
-        var header: Header =
-            @bitCast((try reader.peekArray(@sizeOf(Header))).*);
-
-        if (consts.native_endian != .big) {
-            std.mem.byteSwapAllFields(Header, &header);
-        }
-
+    pub fn peek(reader: *std.Io.Reader) Header.DecodeError!Header {
+        var header: Header = @bitCast((try reader.peekArray(@sizeOf(Header))).*);
+        maybeByteSwap(&header);
         return header;
+    }
+
+    pub inline fn maybeByteSwap(header: *Header) void {
+        if (consts.native_endian != consts.encode_endian) {
+            header.sample_rate_hz = @byteSwap(header.sample_rate_hz);
+            header.samples_per_channel = @byteSwap(header.samples_per_channel);
+            header.frame_size = @byteSwap(header.frame_size);
+        }
     }
 
     /// Gets the size of the buffer required to allocate all the samples for the frame
@@ -164,10 +158,8 @@ pub const LmsState = struct {
         return @reduce(.Add, self.history *% self.weights) >> 13;
     }
 
-    pub fn decode(
-        reader: *std.Io.Reader,
-    ) LmsState.DecodeError!LmsState {
-        const t = try reader.takeStruct(LmsState16, .big);
+    pub fn take(reader: *std.Io.Reader) LmsState.DecodeError!LmsState {
+        const t = try reader.takeStruct(LmsState16, consts.encode_endian);
         return .{ .history = t.history, .weights = t.weights };
     }
 };

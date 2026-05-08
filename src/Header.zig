@@ -13,21 +13,17 @@ pub const DecodeError = error{
 };
 
 /// Checks the magic and returns the SamplesPerChannel for this file
-pub fn decode(
-    reader: *std.Io.Reader,
-) DecodeError!Header {
+pub fn take(reader: *std.Io.Reader) DecodeError!Header {
     try checkMagic(reader);
-    return .{ .samples_per_channel = try .decode(reader) };
+    return .{ .samples_per_channel = try .take(reader) };
 }
 
 pub const SamplesPerChannel = enum(u32) {
     streaming = 0,
     _,
 
-    pub fn decode(
-        reader: *std.Io.Reader,
-    ) DecodeError!SamplesPerChannel {
-        return @enumFromInt(try reader.takeInt(u32, .big));
+    pub fn take(reader: *std.Io.Reader) DecodeError!SamplesPerChannel {
+        return @enumFromInt(try reader.takeInt(u32, consts.encode_endian));
     }
 
     const max_samples_per_frame = consts.num_samples_in_slice * consts.max_slices_per_frame;

@@ -15,17 +15,17 @@ test "decode qoa header" {
         samples = rng.int(@TypeOf(samples));
         header_buf = "qoaf" ++ std.mem.toBytes(std.mem.nativeToBig(@TypeOf(samples), samples));
         reader = .fixed(header_buf);
-        decoded = try qoa.Header.decode(&reader);
+        decoded = try qoa.Header.take(&reader);
 
         samples = rng.int(@TypeOf(samples));
         header_buf = "qoaf" ++ std.mem.toBytes(std.mem.nativeToBig(@TypeOf(samples), samples));
         reader = .fixed(header_buf);
-        decoded = try qoa.Header.decode(&reader);
+        decoded = try qoa.Header.take(&reader);
 
         samples = rng.int(@TypeOf(samples));
         header_buf = "qoaf" ++ std.mem.toBytes(std.mem.nativeToBig(@TypeOf(samples), samples));
         reader = .fixed(header_buf);
-        decoded = try qoa.Header.decode(&reader);
+        decoded = try qoa.Header.take(&reader);
     }
 
     { // unhappy path
@@ -37,7 +37,7 @@ test "decode qoa header" {
             rng.bytes(&buf);
             header_buf = buf[0..];
             reader = .fixed(header_buf);
-            try assertEq(qoa.Header.decode(&reader), error.InvalidFileFormat);
+            try assertEq(qoa.Header.take(&reader), error.InvalidFileFormat);
         }
 
         // too small
@@ -47,7 +47,7 @@ test "decode qoa header" {
             rng.bytes(&buf);
             header_buf = buf[0..];
             reader = .fixed(header_buf);
-            try assertEq(qoa.Header.decode(&reader), error.EndOfStream);
+            try assertEq(qoa.Header.take(&reader), error.EndOfStream);
         }
 
         // no magic
@@ -55,8 +55,24 @@ test "decode qoa header" {
             samples = rng.int(@TypeOf(samples));
             header_buf = "qafo" ++ std.mem.toBytes(std.mem.nativeToBig(@TypeOf(samples), samples));
             reader = .fixed(header_buf);
-            try assertEq(qoa.Header.decode(&reader), error.InvalidFileFormat);
+            try assertEq(qoa.Header.take(&reader), error.InvalidFileFormat);
         }
+    }
+}
+
+test "decode test files" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    const dir = try std.Io.Dir.cwd().openDir(io, "test/test_files/songs", .{ .iterate = true });
+
+    var threads = std.ArrayList(std.Thread).empty;
+    defer threads.deinit(alloc);
+
+    try parseQOARecursive(alloc, &threads, io, dir);
+
+    for (threads.items) |thread| {
+        thread.join();
     }
 }
 
@@ -99,11 +115,20 @@ fn parseQOAFile(gpa: std.mem.Allocator, io: std.Io, file: std.Io.File) !void {
     var iobuf: [1024]u8 = undefined;
     var reader = file.reader(io, &iobuf);
 
-    const header, var frame_iterator = try qoa.FrameIter.init(&reader.interface);
+    var frame_iterator = try qoa.FrameIter.init(&reader.interface);
+    const header = try frame_iterator.peekFrameHeader();
     var sample_list = try std.ArrayList(i16).initCapacity(gpa, frame_iterator.overestimateSamplesRemaining(header.num_channels));
     defer sample_list.deinit(gpa);
-    _ = try frame_iterator.decodeRemaining(&sample_list);
+    _ = try frame_iterator.decodeRemaining(gpa, &sample_list);
 
-    std.debug.print("audio.header = {any}\n", .{header});
-    std.debug.print("audio.samples.len  = {}\n", .{sample_list.items.len});
+    std.log.debug(
+        \\Parsed {any}
+        \\audio.header = {any}
+        \\audio.samples.len = {}
+        \\-------------------------------------------------------------------------------------
+    , .{
+        file,
+        header,
+        sample_list.items.len,
+    });
 }
