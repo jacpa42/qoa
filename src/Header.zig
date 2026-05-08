@@ -7,7 +7,9 @@ pub const magic = "qoaf";
 samples_per_channel: SamplesPerChannel,
 
 pub const DecodeError = error{
+    ExceededMaxDecodeChannels,
     InvalidFileFormat,
+    StreamingNotSupported,
     ReadFailed,
     EndOfStream,
 };

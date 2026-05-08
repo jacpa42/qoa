@@ -116,8 +116,7 @@ fn parseQOAFile(gpa: std.mem.Allocator, io: std.Io, file: std.Io.File) !void {
     var reader = file.reader(io, &iobuf);
 
     var frame_iterator = try qoa.FrameIter.init(&reader.interface);
-    const header = try frame_iterator.peekFrameHeader();
-    var sample_list = try std.ArrayList(i16).initCapacity(gpa, frame_iterator.overestimateSamplesRemaining(header.num_channels));
+    var sample_list = try std.ArrayList(i16).initCapacity(gpa, frame_iterator.overestimateSamplesRemaining());
     defer sample_list.deinit(gpa);
     _ = try frame_iterator.decodeRemaining(gpa, &sample_list);
 
@@ -128,7 +127,7 @@ fn parseQOAFile(gpa: std.mem.Allocator, io: std.Io, file: std.Io.File) !void {
         \\-------------------------------------------------------------------------------------
     , .{
         file,
-        header,
+        frame_iterator.frame_header,
         sample_list.items.len,
     });
 }

@@ -31,41 +31,42 @@ pub const FrameIter = struct {
     /// Total samples decoded from reader so far
     samples_decoded: u32,
     total_samples_per_channel: Header.SamplesPerChannel,
+    /// The first frame's header in the file
+    frame_header: Frame.Header,
 
     const InitError = Header.DecodeError;
-    const DecodeError = error{ ExceededMaxDecodeChannels, OutOfMemory, ReadFailed, EndOfStream };
+    const DecodeError = error{ MalformedFrame, ReadFailed, EndOfStream };
 
     /// NOTE: Reader must be at the start of the file.
     pub fn init(reader: *std.Io.Reader) InitError!FrameIter {
         const header = try Header.take(reader);
-
         if (header.samples_per_channel == .streaming) {
-            @panic("Streaming files is not supported at the moment :)");
+            return error.StreamingNotSupported;
+        }
+
+        const first_frame_header = try Frame.Header.peek(reader);
+        if (first_frame_header.num_channels > consts.max_decode_channels) {
+            return error.ExceededMaxDecodeChannels;
         }
 
         const iter = FrameIter{
             .reader = reader,
             .samples_decoded = 0,
             .total_samples_per_channel = header.samples_per_channel,
+            .frame_header = first_frame_header,
         };
 
         return iter;
     }
 
-    /// Useful if you want to check what is happening with with the next frame
-    /// of the sound.
-    pub inline fn peekFrameHeader(self: FrameIter) Frame.Header.DecodeError!Frame.Header {
-        return Frame.Header.peek(self.reader);
-    }
-
-    pub fn overestimateSamplesRemaining(self: *const FrameIter, num_channels: u8) usize {
+    pub fn overestimateSamplesRemaining(self: FrameIter) usize {
         assert(self.total_samples_per_channel != .streaming);
         assert(@intFromEnum(self.total_samples_per_channel) >= 1); // same as
         // above :)
 
         const total_frames_per_channel = self.total_samples_per_channel.totalFramesPerChannel() orelse unreachable;
         const overestimated_total_samples_in_whole_file =
-            consts.overEstimateTotalSamples(num_channels, total_frames_per_channel);
+            consts.overEstimateTotalSamples(self.frame_header.num_channels, total_frames_per_channel);
 
         return overestimated_total_samples_in_whole_file -| self.samples_decoded;
     }
@@ -89,8 +90,13 @@ pub const FrameIter = struct {
             return e; // Else some nefarious error occurred.
         };
 
+        if (header.num_channels != self.frame_header.num_channels or
+            header.sample_rate_hz != self.frame_header.sample_rate_hz)
+        {
+            return error.MalformedFrame;
+        }
+
         // Initialize the lms states
-        if (header.num_channels > consts.max_decode_channels) return error.ExceededMaxDecodeChannels;
         var lms: [consts.max_decode_channels]Frame.LmsState = undefined;
         for (lms[0..header.num_channels]) |*state| state.* = try .take(self.reader);
 
@@ -112,23 +118,31 @@ pub const FrameIter = struct {
         self: *FrameIter,
         gpa: std.mem.Allocator,
         list: *std.ArrayList(i16),
+    ) (error{OutOfMemory} || DecodeError)![]i16 {
+        assert(self.total_samples_per_channel != .streaming);
+        assert(@intFromEnum(self.total_samples_per_channel) >= 1); // same as
+        // above :)
+
+        // Ensure that we have enough capacity to hold all the frames
+        try list.ensureUnusedCapacity(gpa, self.overestimateSamplesRemaining());
+        return self.decodeRemainingAssumeCapacity(list);
+    }
+
+    /// Decodes all the remaining frames and appends them to the array list.
+    ///
+    /// Returns the slice of decoded samples.
+    ///
+    /// The slice is empty if we are at the end of the stream.
+    pub fn decodeRemainingAssumeCapacity(
+        self: *FrameIter,
+        list: *std.ArrayList(i16),
     ) DecodeError![]i16 {
         assert(self.total_samples_per_channel != .streaming);
         assert(@intFromEnum(self.total_samples_per_channel) >= 1); // same as
         // above :)
 
-        var header = Frame.Header.peek(self.reader) catch |e| {
-            if (e == error.EndOfStream) return &.{}; // This must be the end of
-            // the file
-            return e; // Else some nefarious error occurred.
-        };
-
         // Ensure that we have enough capacity to hold all the frames
-        try list.ensureUnusedCapacity(gpa, self.overestimateSamplesRemaining(header.num_channels));
-
-        // Create lms buf
-        if (header.num_channels > consts.max_decode_channels) return error.ExceededMaxDecodeChannels;
-        var lms_state_buf: [consts.max_decode_channels]Frame.LmsState = undefined;
+        assert(list.unusedCapacitySlice().len >= self.overestimateSamplesRemaining());
 
         const num_frames_per_channel_remaining =
             (self.total_samples_per_channel.totalFramesPerChannel() orelse unreachable) -
@@ -136,9 +150,16 @@ pub const FrameIter = struct {
 
         const new_samples_start_idx = list.items.len;
 
+        var lms_state_buf: [consts.max_decode_channels]Frame.LmsState = undefined;
+
         for (0..num_frames_per_channel_remaining) |_| {
             // read the frame header
-            header = try Frame.Header.take(self.reader);
+            const header = try Frame.Header.take(self.reader);
+            if (header.num_channels != self.frame_header.num_channels or
+                header.sample_rate_hz != self.frame_header.sample_rate_hz)
+            {
+                return error.MalformedFrame;
+            }
 
             // Decode the lms states
             const lms_states = lms_state_buf[0..header.num_channels];

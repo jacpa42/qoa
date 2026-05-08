@@ -56,18 +56,17 @@ pub fn main(init: std.process.Init) !void {
             file_readers[i] = file.reader(io, iobuf);
 
             const frame_iter = try qoa.FrameIter.init(&file_readers[i].interface);
-            const frame_header = try frame_iter.peekFrameHeader();
 
             if (num_channels_opt) |c| {
-                if (frame_header.num_channels != c) return error.NotAllFilesHaveSameNumberOfChannels;
-            } else num_channels_opt = frame_header.num_channels;
+                if (frame_iter.frame_header.num_channels != c) return error.NotAllFilesHaveSameNumberOfChannels;
+            } else num_channels_opt = frame_iter.frame_header.num_channels;
 
             if (sample_rate_hz_opt) |s| {
-                if (frame_header.sample_rate_hz != s) return error.NotAllFilesHaveSameSampleRate;
-            } else sample_rate_hz_opt = frame_header.sample_rate_hz;
+                if (frame_iter.frame_header.sample_rate_hz != s) return error.NotAllFilesHaveSameSampleRate;
+            } else sample_rate_hz_opt = frame_iter.frame_header.sample_rate_hz;
 
             // NOTE: as we are *not* in streaming mode, we can use the number of samples in the first frame as the upper bound for samples in the whole file.
-            const buf = try sample_buffers.addManyAsSliceBounded(frame_header.frameSampleCount());
+            const buf = try sample_buffers.addManyAsSliceBounded(frame_iter.frame_header.frameSampleCount());
             sample_iter.* = qoa.SampleIter.initFrameIter(frame_iter, buf);
         }
         break :blk sample_iters;
@@ -92,9 +91,9 @@ pub fn main(init: std.process.Init) !void {
         , .{
             num_channels,
             sample_rate_hz,
-            sample_iter.frame_iter.overestimateSamplesRemaining(num_channels),
+            sample_iter.frame_iter.overestimateSamplesRemaining(),
             args.speed,
-            sample_iter.frame_iter.overestimateSamplesRemaining(num_channels) / (sample_rate_hz * std.time.s_per_min),
+            sample_iter.frame_iter.overestimateSamplesRemaining() / (sample_rate_hz * std.time.s_per_min),
         });
     };
 
