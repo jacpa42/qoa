@@ -427,11 +427,13 @@ pub const SampleIter = struct {
 
 /// Walks over a decoded sound rather than an encoded one.
 pub const StaticSampleIter = struct {
-    samples: []i16,
+    samples: []i16 = &.{},
 
     /// Just an index into the `sample_list`. Can be modified directly to change
     /// the position of the sound
-    pos: usize,
+    pos: usize = 0,
+
+    pub const empty = StaticSampleIter{};
 
     pub const InitError = FrameIter.InitError || FrameIter.DecodeError || error{OutOfMemory};
 
@@ -471,7 +473,7 @@ pub const StaticSampleIter = struct {
     }
 
     pub fn deinit(self: StaticSampleIter, gpa: std.mem.Allocator) void {
-        self.samples.deinit(gpa);
+        gpa.free(self.samples);
     }
 
     /// Tries to read `size` into `self.samples`, returning the slice which is the
